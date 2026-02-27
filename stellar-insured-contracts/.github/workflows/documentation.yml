@@ -1,0 +1,39 @@
+name: Documentation
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'contracts/**'
+      - 'docs/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'contracts/**'
+      - 'docs/**'
+
+jobs:
+  verify-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate Documentation
+        run: cargo doc --no-deps --all-features
+
+      - name: Verify Markdown Links
+        uses: gaurav-nelson/github-action-markdown-link-check@v1
+        with:
+          use-quiet-mode: 'yes'
+          use-verbose-mode: 'no'
+          folder-path: 'docs'
+        continue-on-error: true
+
+      - name: Archive documentation
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-docs
+          path: target/doc

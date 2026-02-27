@@ -1,904 +1,1282 @@
-#![no_std]
-
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
-};
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-const ADMIN: Symbol = symbol_short!("ADMIN");
-const PAUSED: Symbol = symbol_short!("PAUSED");
-const CONFIG: Symbol = symbol_short!("CONFIG");
-const ORACLE_DATA: Symbol = symbol_short!("ORA_DATA");
-const ORACLE_HISTORY: Symbol = symbol_short!("ORA_HIST");
-const SUBMISSIONS: Symbol = symbol_short!("SUBS");
-const THRESHOLDS: Symbol = symbol_short!("THRESH");
-
-// Default thresholds for oracle validation
-const DEFAULT_MIN_SUBMISSIONS: u32 = 3;
-const DEFAULT_MAJORITY_THRESHOLD: u32 = 66; // 66% (2 out of 3)
-const DEFAULT_OUTLIER_DEVIATION: i128 = 15; // 15% deviation threshold
-const DEFAULT_STALENESS_THRESHOLD_SECONDS: u64 = 3600; // 1 hour
-
-// ============================================================================
-// Error Handling
-// ============================================================================
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-pub enum OracleError {
-    Unauthorized = 1,
-    Paused = 2,
-    InvalidInput = 3,
-    InsufficientSubmissions = 4,
-    NotFound = 5,
-    AlreadyInitialized = 6,
-    NotInitialized = 7,
-    StaleData = 8,
-    OutlierDetected = 9,
-    ConsensusNotReached = 10,
-    InvalidThreshold = 11,
-    DuplicateSubmission = 12,
-}
-
-// ============================================================================
-// Type Definitions
-// ============================================================================
-
-/// Validation thresholds for oracle consensus
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValidationThreshold {
-    /// Minimum number of oracle submissions required
-    pub min_submissions: u32,
-    /// Percentage threshold for consensus (0-100)
-    pub majority_threshold_percent: u32,
-    /// Maximum allowed deviation for outlier detection (in basis points: 1000 = 10%)
-    pub outlier_deviation_percent: i128,
-    /// Maximum age of oracle data in seconds
-    pub staleness_threshold_seconds: u64,
-}
-
-impl ValidationThreshold {
-    pub fn default() -> Self {
-        ValidationThreshold {
-            min_submissions: DEFAULT_MIN_SUBMISSIONS,
-            majority_threshold_percent: DEFAULT_MAJORITY_THRESHOLD,
-            outlier_deviation_percent: DEFAULT_OUTLIER_DEVIATION,
-            staleness_threshold_seconds: DEFAULT_STALENESS_THRESHOLD_SECONDS,
-        }
-    }
-}
-
-/// Individual oracle submission
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OracleSubmission {
-    /// Address of the oracle provider
-    pub oracle: Address,
-    /// Data value submitted
-    pub value: i128,
-    /// Timestamp of submission
-    pub timestamp: u64,
-    /// Optional metadata/signature from oracle
-    pub source_id: u32,
-}
-
-/// Finalized oracle data with consensus proof
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OracleData {
-    /// Unique identifier for this oracle data point
-    pub data_id: u64,
-    /// The consensus value determined by validators
-    pub consensus_value: i128,
-    /// Number of submissions supporting this value
-    pub submission_count: u32,
-    /// Percentage agreement from oracle submissions
-    pub consensus_percentage: u32,
-    /// Timestamp when consensus was reached
-    pub finalized_at: u64,
-    /// Submissions that were included in final value
-    pub included_submissions: u32,
-    /// Submissions that were rejected as outliers
-    pub rejected_submissions: u32,
-}
-
-/// Configuration for the oracle contract
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Config {
-    pub admin: Address,
-}
-
-/// Statistics about oracle operations
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OracleStats {
-    pub total_submissions: u64,
-    pub total_consensus_reached: u64,
-    pub consensus_failures: u64,
-    pub average_submissions_per_data: u32,
-}
-
-// ============================================================================
-// Oracle Contract
-// ============================================================================
-
-#[contract]
-pub struct OracleContract;
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-fn require_admin(env: &Env) -> Result<Address, OracleError> {
-    let admin: Address =
-        env.storage().persistent().get(&ADMIN).ok_or(OracleError::NotInitialized)?;
-
-    // NOTE: This contract was written against an older soroban-sdk API that exposed
-    // `env.invoker()`. In soroban-sdk 25, tests typically use `mock_all_auths()` and
-    // contract functions should accept explicit `Address` parameters to authenticate.
-    // For now, we only gate on admin existence.
-
-    Ok(admin)
-}
-
-fn is_paused(env: &Env) -> bool {
-    env.storage().persistent().get(&PAUSED).unwrap_or(false)
-}
-
-fn get_thresholds(env: &Env) -> ValidationThreshold {
-    env.storage()
-        .persistent()
-        .get(&THRESHOLDS)
-        .unwrap_or_else(ValidationThreshold::default)
-}
-
-fn set_thresholds(env: &Env, thresholds: &ValidationThreshold) {
-    env.storage().persistent().set(&THRESHOLDS, thresholds);
-}
-
-/// Calculate median of values
-fn calculate_median(values: &Vec<i128>) -> i128 {
-    if values.is_empty() {
-        return 0;
-    }
-
-    let len = values.len();
-
-    // Simple bubble sort for small datasets (safe in blockchain context)
-    let mut sorted = values.clone();
-    for i in 0..len {
-        for j in 0..(len - i - 1) {
-            if sorted.get(j).unwrap() > sorted.get(j + 1).unwrap() {
-                let temp = sorted.get(j).unwrap();
-                sorted.set(j, sorted.get(j + 1).unwrap());
-                sorted.set(j + 1, temp);
-            }
-        }
-    }
-
-    if len % 2 == 1 {
-        sorted.get(len / 2).unwrap()
-    } else {
-        (sorted.get(len / 2 - 1).unwrap() + sorted.get(len / 2).unwrap()) / 2
-    }
-}
-
-/// Calculate weighted average (simple equal weighting for all submissions)
-fn calculate_weighted_average(values: &Vec<i128>) -> i128 {
-    if values.is_empty() {
-        return 0;
-    }
-
-    let mut sum: i128 = 0;
-    for i in 0..values.len() {
-        sum = sum.saturating_add(values.get(i).unwrap());
-    }
-
-    sum / (values.len() as i128)
-}
-
-/// Detect outliers using interquartile range (IQR) method
-fn detect_outliers(values: &Vec<i128>, deviation_percent: i128) -> Vec<bool> {
-    let len = values.len();
-    let mut outlier_flags: Vec<bool> = Vec::new(values.env());
-
-    if len < 3 {
-        // With fewer than 3 values, no outlier detection
-        for _ in 0..len {
-            outlier_flags.push_back(false);
-        }
-        return outlier_flags;
-    }
-
-    // Calculate median (central value)
-    let median = calculate_median(values);
-
-    // Calculate acceptable deviation range
-    let deviation_basis = if median > 0 { median } else { 1 };
-    let max_deviation = (deviation_basis.abs() * deviation_percent) / 100;
-
-    // Mark values outside deviation range as outliers
-    for i in 0..len {
-        let value = values.get(i).unwrap();
-        let diff = if value > median {
-            value - median
-        } else {
-            median - value
-        };
-
-        let is_outlier = diff > max_deviation;
-        outlier_flags.push_back(is_outlier);
-    }
-
-    outlier_flags
-}
-
-/// Check if oracle data is stale
-fn is_data_stale(timestamp: u64, current_time: u64, staleness_threshold: u64) -> bool {
-    if current_time < timestamp {
-        return true; // Future timestamp is invalid
-    }
-    (current_time - timestamp) > staleness_threshold
-}
-
-// ============================================================================
-// Oracle Contract Implementation
-// ============================================================================
-
-#[contractimpl]
-impl OracleContract {
-    /// Initialize the oracle contract
-    pub fn initialize(env: Env, admin: Address) -> Result<(), OracleError> {
-        if env.storage().persistent().has(&ADMIN) {
-            return Err(OracleError::AlreadyInitialized);
-        }
-
-        admin.require_auth();
-
-        env.storage().persistent().set(&ADMIN, &admin);
-        env.storage().persistent().set(&PAUSED, &false);
-
-        let default_thresholds = ValidationThreshold::default();
-        set_thresholds(&env, &default_thresholds);
-
-        Ok(())
-    }
-
-    /// Pause or unpause the contract
-    pub fn set_paused(env: Env, paused: bool) -> Result<(), OracleError> {
-        let _admin = require_admin(&env)?;
-        env.storage().persistent().set(&PAUSED, &paused);
-        Ok(())
-    }
-
-    /// Update validation thresholds
-    pub fn set_thresholds(
-        env: Env,
-        min_submissions: u32,
-        majority_threshold_percent: u32,
-        outlier_deviation_percent: i128,
-        staleness_threshold_seconds: u64,
-    ) -> Result<(), OracleError> {
-        let _admin = require_admin(&env)?;
-
-        if majority_threshold_percent > 100 || outlier_deviation_percent < 0 {
-            return Err(OracleError::InvalidThreshold);
-        }
-
-        let thresholds = ValidationThreshold {
-            min_submissions,
-            majority_threshold_percent,
-            outlier_deviation_percent,
-            staleness_threshold_seconds,
-        };
-
-        set_thresholds(&env, &thresholds);
-        Ok(())
-    }
-
-    /// Get current validation thresholds
-    pub fn get_thresholds(env: Env) -> Result<ValidationThreshold, OracleError> {
-        Ok(get_thresholds(&env))
-    }
-
-    /// Submit oracle data for a specific data point
-    /// Returns true if consensus is reached immediately
-    pub fn submit_oracle_data(env: Env, data_id: u64, value: i128) -> Result<bool, OracleError> {
-        if is_paused(&env) {
-            return Err(OracleError::Paused);
-        }
-
-        // See note in `require_admin` about SDK API differences.
-        // For now, use current contract address as the submitting oracle.
-        let oracle = env.current_contract_address();
-        let current_time = env.ledger().timestamp();
-
-        let submissions_key = (SUBMISSIONS, data_id);
-
-        let mut submissions: Vec<OracleSubmission> = env
-            .storage()
-            .persistent()
-            .get(&submissions_key)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        // Check for duplicate submission from same oracle
-        for i in 0..submissions.len() {
-            let sub = submissions.get(i).unwrap();
-            if sub.oracle == oracle {
-                return Err(OracleError::DuplicateSubmission);
-            }
-        }
-
-        // Add new submission
-        let submission = OracleSubmission {
-            oracle: oracle.clone(),
-            value,
-            timestamp: current_time,
-            source_id: 0,
-        };
-
-        submissions.push_back(submission);
-        env.storage().persistent().set(&submissions_key, &submissions);
-
-        // Try to reach consensus
-        match OracleContract.try_resolve_oracle_data(&env, data_id) {
-            Ok(_) => Ok(true),
-            Err(OracleError::InsufficientSubmissions) => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Attempt to resolve oracle data with consensus validation
-    pub fn resolve_oracle_data(env: Env, data_id: u64) -> Result<OracleData, OracleError> {
-        OracleContract.try_resolve_oracle_data(&env, data_id)
-    }
-
-    /// Internal oracle resolution with validation
-    fn try_resolve_oracle_data(&self, env: &Env, data_id: u64) -> Result<OracleData, OracleError> {
-        let thresholds = get_thresholds(env);
-        let current_time = env.ledger().timestamp();
-
-        let submissions_key = (SUBMISSIONS, data_id);
-        let submissions: Vec<OracleSubmission> =
-            env.storage().persistent().get(&submissions_key).ok_or(OracleError::NotFound)?;
-
-        let submission_count = submissions.len() as u32;
-
-        // Check minimum submissions
-        if submission_count < thresholds.min_submissions {
-            return Err(OracleError::InsufficientSubmissions);
-        }
-
-        // Extract values and check for staleness
-        let mut values: Vec<i128> = Vec::new(&env);
-        for i in 0..submissions.len() {
-            let sub = submissions.get(i).unwrap();
-
-            // Check staleness
-            if is_data_stale(sub.timestamp, current_time, thresholds.staleness_threshold_seconds) {
-                return Err(OracleError::StaleData);
-            }
-
-            values.push_back(sub.value);
-        }
-
-        // Detect outliers
-        let outlier_flags = detect_outliers(&values, thresholds.outlier_deviation_percent);
-
-        // Filter out outliers and calculate consensus
-        let mut valid_values: Vec<i128> = Vec::new(&env);
-        let mut rejected_count = 0u32;
-
-        for i in 0..values.len() {
-            if !outlier_flags.get(i).unwrap() {
-                valid_values.push_back(values.get(i).unwrap());
-            } else {
-                rejected_count += 1;
-            }
-        }
-
-        let valid_count = valid_values.len() as u32;
-
-        // Verify consensus threshold is met
-        let consensus_percentage = (valid_count * 100) / submission_count;
-
-        if consensus_percentage < thresholds.majority_threshold_percent {
-            return Err(OracleError::ConsensusNotReached);
-        }
-
-        // Calculate final consensus value (using median for robustness)
-        let consensus_value = calculate_median(&valid_values);
-
-        // Store the resolved oracle data
-        let oracle_data = OracleData {
-            data_id,
-            consensus_value,
-            submission_count,
-            consensus_percentage,
-            finalized_at: current_time,
-            included_submissions: valid_count,
-            rejected_submissions: rejected_count,
-        };
-
-        // Store the finalized data
-        env.storage().persistent().set(&(ORACLE_DATA, data_id), &oracle_data);
-
-        // Clear submissions after resolution
-        env.storage().persistent().remove(&submissions_key);
-
-        Ok(oracle_data)
-    }
-
-    /// Get resolved oracle data
-    pub fn get_oracle_data(env: Env, data_id: u64) -> Result<OracleData, OracleError> {
-        env.storage()
-            .persistent()
-            .get(&(ORACLE_DATA, data_id))
-            .ok_or(OracleError::NotFound)
-    }
-
-    /// Get pending submissions for a data point
-    pub fn get_pending_submissions(
-        env: Env,
-        data_id: u64,
-    ) -> Result<Vec<OracleSubmission>, OracleError> {
-        let submissions_key = (SUBMISSIONS, data_id);
-        env.storage().persistent().get(&submissions_key).ok_or(OracleError::NotFound)
-    }
-
-    /// Get submission count for a data point
-    pub fn get_submission_count(env: Env, data_id: u64) -> Result<u32, OracleError> {
-        let submissions_key = (SUBMISSIONS, data_id);
-        let submissions: Vec<OracleSubmission> =
-            env.storage().persistent().get(&submissions_key).ok_or(OracleError::NotFound)?;
-        Ok(submissions.len() as u32)
-    }
-}
-
-#[cfg(any())]
-mod tests {
+#![cfg_attr(not(feature = "std"), no_std, no_main)]
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::needless_borrows_for_generic_args
+)]
+
+use ink::prelude::*;
+use ink::storage::Mapping;
+use propchain_traits::*;
+
+/// Property Valuation Oracle Contract
+#[ink::contract]
+mod propchain_oracle {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
+    use ink::prelude::{
+        string::{String, ToString},
+        vec::Vec,
+    };
 
-    #[test]
-    fn test_oracle_initialization() {
-        let env = Env::default();
-        let admin = Address::random(&env);
+    /// Property Valuation Oracle storage
+    #[ink(storage)]
+    pub struct PropertyValuationOracle {
+        /// Admin account
+        admin: AccountId,
 
-        let contract = OracleContract {};
-        let result = contract.initialize(env.clone(), admin.clone());
+        /// Property valuations storage
+        pub property_valuations: Mapping<u64, PropertyValuation>,
 
+        /// Historical valuations per property
+        historical_valuations: Mapping<u64, Vec<PropertyValuation>>,
+
+        /// Oracle sources configuration
+        oracle_sources: Mapping<String, OracleSource>,
+
+        /// Active oracle sources list
+        pub active_sources: Vec<String>,
+
+        /// Price alerts configuration
+        pub price_alerts: Mapping<u64, Vec<PriceAlert>>,
+
+        /// Location-based adjustments
+        pub location_adjustments: Mapping<String, LocationAdjustment>,
+
+        /// Market trends data
+        pub market_trends: Mapping<String, MarketTrend>,
+
+        /// Comparable properties cache
+        comparable_cache: Mapping<u64, Vec<ComparableProperty>>,
+
+        /// Maximum staleness for price feeds (in seconds)
+        max_price_staleness: u64,
+
+        /// Minimum sources required for valuation
+        pub min_sources_required: u32,
+
+        /// Outlier detection threshold (standard deviations)
+        outlier_threshold: u32,
+
+        /// Source reputations (0-1000, where 1000 is perfect)
+        pub source_reputations: Mapping<String, u32>,
+
+        /// Source stakes for slashing
+        pub source_stakes: Mapping<String, u128>,
+
+        /// Pending valuation requests: property_id -> timestamp
+        pub pending_requests: Mapping<u64, u64>,
+
+        /// Request counter for unique request IDs
+        pub request_id_counter: u64,
+
+        /// AI valuation contract address
+        ai_valuation_contract: Option<AccountId>,
+    }
+
+    /// Events emitted by the oracle
+    #[ink(event)]
+    pub struct ValuationUpdated {
+        #[ink(topic)]
+        property_id: u64,
+        valuation: u128,
+        confidence_score: u32,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct PriceAlertTriggered {
+        #[ink(topic)]
+        property_id: u64,
+        old_valuation: u128,
+        new_valuation: u128,
+        change_percentage: u32,
+        alert_address: AccountId,
+    }
+
+    #[ink(event)]
+    pub struct OracleSourceAdded {
+        #[ink(topic)]
+        source_id: String,
+        source_type: OracleSourceType,
+        weight: u32,
+    }
+
+    impl PropertyValuationOracle {
+        /// Constructor for the Property Valuation Oracle
+        #[ink(constructor)]
+        pub fn new(admin: AccountId) -> Self {
+            Self {
+                admin,
+                property_valuations: Mapping::default(),
+                historical_valuations: Mapping::default(),
+                oracle_sources: Mapping::default(),
+                active_sources: Vec::new(),
+                price_alerts: Mapping::default(),
+                location_adjustments: Mapping::default(),
+                market_trends: Mapping::default(),
+                comparable_cache: Mapping::default(),
+                max_price_staleness: 3600, // 1 hour
+                min_sources_required: 2,
+                outlier_threshold: 2, // 2 standard deviations
+                source_reputations: Mapping::default(),
+                source_stakes: Mapping::default(),
+                pending_requests: Mapping::default(),
+                request_id_counter: 0,
+                ai_valuation_contract: None,
+            }
+        }
+
+        /// Get property valuation from multiple sources with aggregation
+        #[ink(message)]
+        pub fn get_property_valuation(
+            &self,
+            property_id: u64,
+        ) -> Result<PropertyValuation, OracleError> {
+            self.property_valuations
+                .get(&property_id)
+                .ok_or(OracleError::PropertyNotFound)
+        }
+
+        /// Get property valuation with confidence metrics
+        #[ink(message)]
+        pub fn get_valuation_with_confidence(
+            &self,
+            property_id: u64,
+        ) -> Result<ValuationWithConfidence, OracleError> {
+            let valuation = self.get_property_valuation(property_id)?;
+
+            // Calculate volatility and confidence interval
+            let volatility = self.calculate_volatility(property_id)?;
+            let confidence_interval = self.calculate_confidence_interval(&valuation)?;
+            let outlier_sources = self.detect_outliers(property_id)?;
+
+            Ok(ValuationWithConfidence {
+                valuation,
+                volatility_index: volatility,
+                confidence_interval,
+                outlier_sources,
+            })
+        }
+
+        /// Update property valuation (admin only)
+        #[ink(message)]
+        pub fn update_property_valuation(
+            &mut self,
+            property_id: u64,
+            valuation: PropertyValuation,
+        ) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+
+            // Validate valuation
+            if valuation.valuation == 0 {
+                return Err(OracleError::InvalidValuation);
+            }
+
+            // Store historical valuation
+            self.store_historical_valuation(property_id, valuation.clone());
+
+            // Update current valuation
+            self.property_valuations.insert(&property_id, &valuation);
+
+            // Check price alerts
+            self.check_price_alerts(property_id, valuation.valuation)?;
+
+            // Emit event
+            self.env().emit_event(ValuationUpdated {
+                property_id,
+                valuation: valuation.valuation,
+                confidence_score: valuation.confidence_score,
+                timestamp: self.env().block_timestamp(),
+            });
+
+            Ok(())
+        }
+
+        /// Update property valuation from oracle sources
+        #[ink(message)]
+        pub fn update_valuation_from_sources(
+            &mut self,
+            property_id: u64,
+        ) -> Result<(), OracleError> {
+            // Collect prices from all active sources
+            let prices = self.collect_prices_from_sources(property_id)?;
+
+            if prices.len() < self.min_sources_required as usize {
+                return Err(OracleError::InsufficientSources);
+            }
+
+            // Aggregate prices with outlier detection
+            let aggregated_price = self.aggregate_prices(&prices)?;
+            let confidence_score = self.calculate_confidence_score(&prices)?;
+
+            let valuation = PropertyValuation {
+                property_id,
+                valuation: aggregated_price,
+                confidence_score,
+                sources_used: prices.len() as u32,
+                last_updated: self.env().block_timestamp(),
+                valuation_method: ValuationMethod::MarketData,
+            };
+
+            self.update_property_valuation(property_id, valuation)?;
+            self.clear_pending_request(property_id);
+            Ok(())
+        }
+
+        /// Request a new valuation for a property
+        #[ink(message)]
+        pub fn request_property_valuation(&mut self, property_id: u64) -> Result<u64, OracleError> {
+            // Check if request already pending
+            if let Some(timestamp) = self.pending_requests.get(&property_id) {
+                let current_time = self.env().block_timestamp();
+                if current_time.saturating_sub(timestamp) < self.max_price_staleness {
+                    return Err(OracleError::RequestPending);
+                }
+            }
+
+            let request_id = self.request_id_counter;
+            self.request_id_counter += 1;
+
+            self.pending_requests
+                .insert(&property_id, &self.env().block_timestamp());
+
+            Ok(request_id)
+        }
+
+        /// Batch request valuations for multiple properties
+        #[ink(message)]
+        pub fn batch_request_valuations(
+            &mut self,
+            property_ids: Vec<u64>,
+        ) -> Result<Vec<u64>, OracleError> {
+            let mut request_ids = Vec::new();
+            for id in property_ids {
+                if let Ok(req_id) = self.request_property_valuation(id) {
+                    request_ids.push(req_id);
+                }
+            }
+            Ok(request_ids)
+        }
+
+        /// Update oracle reputation (admin only)
+        #[ink(message)]
+        pub fn update_source_reputation(
+            &mut self,
+            source_id: String,
+            success: bool,
+        ) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            let current_rep = self.source_reputations.get(&source_id).unwrap_or(500); // Start at 500
+
+            let new_rep = if success {
+                (current_rep + 10).min(1000)
+            } else {
+                current_rep.saturating_sub(50)
+            };
+
+            self.source_reputations.insert(&source_id, &new_rep);
+
+            // Auto-deactivate source if reputation falls too low
+            if new_rep < 200 {
+                if let Some(mut source) = self.oracle_sources.get(&source_id) {
+                    source.is_active = false;
+                    self.oracle_sources.insert(&source_id, &source);
+                    self.active_sources.retain(|id| id != &source_id);
+                }
+            }
+
+            Ok(())
+        }
+
+        /// Slash an oracle source for providing bad data (admin only)
+        #[ink(message)]
+        pub fn slash_source(
+            &mut self,
+            source_id: String,
+            penalty: u128,
+        ) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+
+            let current_stake = self.source_stakes.get(&source_id).unwrap_or(0);
+            self.source_stakes
+                .insert(&source_id, &current_stake.saturating_sub(penalty));
+
+            // Also hit the reputation hard
+            self.update_source_reputation(source_id, false)?;
+
+            Ok(())
+        }
+
+        /// Detect if a new valuation is an anomaly based on historical data
+        #[ink(message)]
+        pub fn is_anomaly(&self, property_id: u64, new_valuation: u128) -> bool {
+            if let Some(current) = self.property_valuations.get(&property_id) {
+                let change_pct = self.calculate_percentage_change(current.valuation, new_valuation);
+
+                // If change > 20% in a single update, flag as anomaly unless volatility is high
+                if change_pct > 20 {
+                    let volatility = self.calculate_volatility(property_id).unwrap_or(0);
+                    if volatility < 10 {
+                        // 10% volatility
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        /// Get historical valuations for a property
+        #[ink(message)]
+        pub fn get_historical_valuations(
+            &self,
+            property_id: u64,
+            limit: u32,
+        ) -> Vec<PropertyValuation> {
+            self.historical_valuations
+                .get(&property_id)
+                .unwrap_or_default()
+                .into_iter()
+                .rev() // Most recent first
+                .take(limit as usize)
+                .collect()
+        }
+
+        /// Get market volatility metrics
+        #[ink(message)]
+        pub fn get_market_volatility(
+            &self,
+            property_type: PropertyType,
+            location: String,
+        ) -> Result<VolatilityMetrics, OracleError> {
+            let key = format!("{:?}_{}", property_type, location);
+            self.market_trends
+                .get(&key)
+                .map(|trend| VolatilityMetrics {
+                    property_type: trend.property_type,
+                    location: trend.location,
+                    volatility_index: (trend.trend_percentage.unsigned_abs()).min(100),
+                    average_price_change: trend.trend_percentage,
+                    period_days: trend.period_months * 30, // Approximate
+                    last_updated: trend.last_updated,
+                })
+                .ok_or(OracleError::InvalidParameters)
+        }
+
+        /// Set price alert for a property
+        #[ink(message)]
+        pub fn set_price_alert(
+            &mut self,
+            property_id: u64,
+            threshold_percentage: u32,
+            alert_address: AccountId,
+        ) -> Result<(), OracleError> {
+            let alert = PriceAlert {
+                property_id,
+                threshold_percentage,
+                alert_address,
+                last_triggered: 0,
+                is_active: true,
+            };
+
+            let mut alerts = self.price_alerts.get(&property_id).unwrap_or_default();
+            alerts.push(alert);
+            self.price_alerts.insert(&property_id, &alerts);
+
+            Ok(())
+        }
+        /// Set AI valuation contract address
+        #[ink(message)]
+        pub fn set_ai_valuation_contract(
+            &mut self,
+            ai_contract: AccountId,
+        ) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            self.ai_valuation_contract = Some(ai_contract);
+            Ok(())
+        }
+
+        /// Get AI valuation contract address
+        #[ink(message)]
+        pub fn get_ai_valuation_contract(&self) -> Option<AccountId> {
+            self.ai_valuation_contract
+        }
+
+        /// Add oracle source (admin only)
+        #[ink(message)]
+        pub fn add_oracle_source(&mut self, source: OracleSource) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+
+            if source.weight > 100 {
+                return Err(OracleError::InvalidParameters);
+            }
+
+            self.oracle_sources.insert(&source.id, &source);
+
+            if source.is_active && !self.active_sources.contains(&source.id) {
+                self.active_sources.push(source.id.clone());
+            }
+
+            self.env().emit_event(OracleSourceAdded {
+                source_id: source.id,
+                source_type: source.source_type,
+                weight: source.weight,
+            });
+
+            Ok(())
+        }
+
+        /// Set location adjustment factor (admin only)
+        #[ink(message)]
+        pub fn set_location_adjustment(
+            &mut self,
+            adjustment: LocationAdjustment,
+        ) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            self.location_adjustments
+                .insert(&adjustment.location_code, &adjustment);
+            Ok(())
+        }
+
+        /// Update market trend data (admin only)
+        #[ink(message)]
+        pub fn update_market_trend(&mut self, trend: MarketTrend) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            let key = format!("{:?}_{}", trend.property_type, trend.location);
+            self.market_trends.insert(&key, &trend);
+            Ok(())
+        }
+
+        /// Get comparable properties for AVM analysis
+        #[ink(message)]
+        pub fn get_comparable_properties(
+            &self,
+            property_id: u64,
+            radius_km: u32,
+        ) -> Vec<ComparableProperty> {
+            self.comparable_cache
+                .get(&property_id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|comp| comp.distance_km <= radius_km)
+                .collect()
+        }
+
+        // Helper methods
+
+        fn ensure_admin(&self) -> Result<(), OracleError> {
+            if self.env().caller() != self.admin {
+                return Err(OracleError::Unauthorized);
+            }
+            Ok(())
+        }
+
+        fn collect_prices_from_sources(
+            &self,
+            property_id: u64,
+        ) -> Result<Vec<PriceData>, OracleError> {
+            let mut prices = Vec::new();
+
+            for source_id in &self.active_sources {
+                if let Some(source) = self.oracle_sources.get(source_id) {
+                    // In a real implementation, this would call external price feeds
+                    // For now, we'll simulate price collection
+                    match self.get_price_from_source(&source, property_id) {
+                        Ok(price_data) => {
+                            if self.is_price_fresh(&price_data) {
+                                prices.push(price_data);
+                            }
+                        }
+                        Err(_) => continue, // Skip failed sources
+                    }
+                }
+            }
+
+            Ok(prices)
+        }
+
+        fn get_price_from_source(
+            &self,
+            source: &OracleSource,
+            property_id: u64,
+        ) -> Result<PriceData, OracleError> {
+            // This is a placeholder for actual price feed integration
+            // In production, this would call Chainlink, Pyth, or other oracles
+            match source.source_type {
+                OracleSourceType::Chainlink => {
+                    // Implement Chainlink integration
+                    Err(OracleError::PriceFeedError)
+                }
+                OracleSourceType::Pyth => {
+                    // Implement Pyth integration
+                    Err(OracleError::PriceFeedError)
+                }
+                OracleSourceType::Substrate => {
+                    // Implement Substrate price feed integration (pallets/OCW)
+                    Err(OracleError::PriceFeedError)
+                }
+                OracleSourceType::Manual => {
+                    // Manual price updates only
+                    Err(OracleError::PriceFeedError)
+                }
+                OracleSourceType::Custom => {
+                    // Custom oracle logic
+                    Err(OracleError::PriceFeedError)
+                }
+                OracleSourceType::AIModel => {
+                    // AI model integration - call AI valuation contract
+                    if let Some(_ai_contract) = self.ai_valuation_contract {
+                        // In production, this would make a cross-contract call to AI valuation engine
+                        // For now, return a mock price based on property_id
+                        let mock_price = 500000u128 + (property_id as u128 * 1000);
+                        Ok(PriceData {
+                            price: mock_price,
+                            timestamp: self.env().block_timestamp(),
+                            source: source.id.clone(),
+                        })
+                    } else {
+                        Err(OracleError::PriceFeedError)
+                    }
+                }
+            }
+        }
+
+        fn is_price_fresh(&self, price_data: &PriceData) -> bool {
+            let current_time = self.env().block_timestamp();
+            current_time.saturating_sub(price_data.timestamp) <= self.max_price_staleness
+        }
+
+        pub fn aggregate_prices(&self, prices: &[PriceData]) -> Result<u128, OracleError> {
+            if prices.len() < self.min_sources_required as usize {
+                return Err(OracleError::InsufficientSources);
+            }
+
+            // Remove outliers
+            let filtered_prices = self.filter_outliers(prices);
+
+            if filtered_prices.is_empty() {
+                return Err(OracleError::InsufficientSources);
+            }
+
+            // Weighted average based on source weights
+            let mut total_weighted_price = 0u128;
+            let mut total_weight = 0u32;
+
+            for price_data in &filtered_prices {
+                let weight = self.get_source_weight(&price_data.source)?;
+                total_weighted_price += price_data.price * weight as u128;
+                total_weight += weight;
+            }
+
+            if total_weight == 0 {
+                return Err(OracleError::InvalidParameters);
+            }
+
+            Ok(total_weighted_price / total_weight as u128)
+        }
+
+        pub fn filter_outliers(&self, prices: &[PriceData]) -> Vec<PriceData> {
+            if prices.len() < 3 {
+                return prices.to_vec();
+            }
+
+            // Calculate mean
+            let sum: u128 = prices.iter().map(|p| p.price).sum();
+            let mean = sum / prices.len() as u128;
+
+            // Calculate standard deviation using fixed point arithmetic
+            let variance: u128 = prices
+                .iter()
+                .map(|p| {
+                    let diff = p.price.abs_diff(mean);
+                    diff * diff
+                })
+                .sum();
+
+            let variance_avg = variance / prices.len() as u128;
+            // Integer square root via Newton-Raphson.
+            // Starting from variance_avg is always an upper bound (sqrt(x) <= x for x >= 1),
+            // so the sequence decreases monotonically to floor(sqrt(variance_avg)).
+            let std_dev = if variance_avg == 0 {
+                0u128
+            } else {
+                let mut x = variance_avg;
+                loop {
+                    let y = (x + variance_avg / x) / 2;
+                    if y >= x {
+                        break x; // converged
+                    }
+                    x = y;
+                }
+            };
+
+            // Filter outliers (beyond threshold standard deviations)
+            prices
+                .iter()
+                .filter(|p| {
+                    let diff = p.price.abs_diff(mean);
+                    diff <= std_dev * self.outlier_threshold as u128
+                })
+                .cloned()
+                .collect()
+        }
+
+        fn get_source_weight(&self, source_id: &str) -> Result<u32, OracleError> {
+            self.oracle_sources
+                .get(&source_id.to_string())
+                .map(|source| source.weight)
+                .ok_or(OracleError::OracleSourceNotFound)
+        }
+
+        pub fn calculate_confidence_score(&self, prices: &[PriceData]) -> Result<u32, OracleError> {
+            if prices.is_empty() {
+                return Ok(0);
+            }
+
+            // Simple confidence based on number of sources and price variance
+            let source_confidence = (prices.len() as u32 * 25).min(75); // Max 75 from sources
+
+            // Calculate coefficient of variation
+            let sum: u128 = prices.iter().map(|p| p.price).sum();
+            let mean = sum / prices.len() as u128;
+
+            let variance: u128 = prices
+                .iter()
+                .map(|p| {
+                    let diff = p.price.abs_diff(mean);
+                    diff * diff
+                })
+                .sum();
+
+            // Calculate coefficient of variation using fixed point arithmetic
+            let std_dev = if !prices.is_empty() {
+                let variance_avg = variance / prices.len() as u128;
+                // Simple approximation of square root (for fixed point)
+                let mut approx = variance_avg;
+                for _ in 0..5 {
+                    // Newton-Raphson approximation
+                    if approx > 0 {
+                        approx = (approx + variance_avg / approx) / 2;
+                    }
+                }
+                approx
+            } else {
+                0
+            };
+
+            let cv = if mean > 0 {
+                (std_dev * 10000) / mean // Multiply by 10000 for precision
+            } else {
+                10000
+            };
+
+            // Lower CV = higher confidence (CV is in basis points)
+            let variance_confidence = if cv <= 10000 {
+                ((10000 - cv) / 400) as u32 // Scale to 0-25 range
+            } else {
+                0
+            };
+
+            Ok(source_confidence + variance_confidence)
+        }
+
+        fn calculate_volatility(&self, property_id: u64) -> Result<u32, OracleError> {
+            let historical = self.get_historical_valuations(property_id, 30); // Last 30 valuations
+
+            if historical.len() < 2 {
+                return Ok(0);
+            }
+
+            // Calculate price changes
+            let mut changes = Vec::new();
+            for i in 1..historical.len() {
+                let prev = historical[i - 1].valuation;
+                let curr = historical[i].valuation;
+
+                if prev > 0 {
+                    let change = (curr.abs_diff(prev) * 10000) / prev;
+                    changes.push(change);
+                }
+            }
+
+            // Average absolute change as volatility index (in basis points)
+            let total_change: u128 = changes.iter().sum();
+            let avg_change_bp = total_change / changes.len() as u128;
+            Ok((avg_change_bp / 100).min(100) as u32) // Convert to percentage
+        }
+
+        fn calculate_confidence_interval(
+            &self,
+            valuation: &PropertyValuation,
+        ) -> Result<(u128, u128), OracleError> {
+            // Simple confidence interval based on confidence score
+            let margin = valuation.valuation * (100 - valuation.confidence_score) as u128 / 10000; // 1% per confidence point
+
+            Ok((
+                valuation.valuation.saturating_sub(margin),
+                valuation.valuation + margin,
+            ))
+        }
+
+        fn detect_outliers(&self, _property_id: u64) -> Result<u32, OracleError> {
+            // This would implement outlier detection logic
+            // For now, return 0
+            Ok(0)
+        }
+
+        fn store_historical_valuation(&mut self, property_id: u64, valuation: PropertyValuation) {
+            let mut history = self
+                .historical_valuations
+                .get(&property_id)
+                .unwrap_or_default();
+            history.push(valuation);
+
+            // Keep only last 100 valuations
+            if history.len() > 100 {
+                let start_index = history.len() - 100;
+                history = history.into_iter().skip(start_index).collect();
+            }
+
+            self.historical_valuations.insert(&property_id, &history);
+        }
+
+        fn check_price_alerts(
+            &mut self,
+            property_id: u64,
+            new_valuation: u128,
+        ) -> Result<(), OracleError> {
+            if let Some(last_valuation) = self.property_valuations.get(&property_id) {
+                let change_percentage =
+                    self.calculate_percentage_change(last_valuation.valuation, new_valuation);
+
+                if let Some(alerts) = self.price_alerts.get(&property_id) {
+                    for alert in alerts {
+                        if alert.is_active
+                            && change_percentage >= alert.threshold_percentage as u128
+                        {
+                            self.env().emit_event(PriceAlertTriggered {
+                                property_id,
+                                old_valuation: last_valuation.valuation,
+                                new_valuation,
+                                change_percentage: change_percentage as u32,
+                                alert_address: alert.alert_address,
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        pub fn calculate_percentage_change(&self, old_value: u128, new_value: u128) -> u128 {
+            if old_value == 0 {
+                return 0;
+            }
+
+            let diff = new_value.abs_diff(old_value);
+
+            (diff * 100) / old_value
+        }
+
+        /// Clear pending request after successful update
+        fn clear_pending_request(&mut self, property_id: u64) {
+            self.pending_requests.remove(&property_id);
+        }
+    }
+
+    /// Implementation of the Oracle trait from propchain-traits
+    impl propchain_traits::Oracle for PropertyValuationOracle {
+        #[ink(message)]
+        fn get_valuation(&self, property_id: u64) -> Result<PropertyValuation, OracleError> {
+            self.get_property_valuation(property_id)
+        }
+
+        #[ink(message)]
+        fn get_valuation_with_confidence(
+            &self,
+            property_id: u64,
+        ) -> Result<ValuationWithConfidence, OracleError> {
+            self.get_valuation_with_confidence(property_id)
+        }
+
+        #[ink(message)]
+        fn request_valuation(&mut self, property_id: u64) -> Result<u64, OracleError> {
+            self.request_property_valuation(property_id)
+        }
+
+        #[ink(message)]
+        fn batch_request_valuations(
+            &mut self,
+            property_ids: Vec<u64>,
+        ) -> Result<Vec<u64>, OracleError> {
+            self.batch_request_valuations(property_ids)
+        }
+
+        #[ink(message)]
+        fn get_historical_valuations(
+            &self,
+            property_id: u64,
+            limit: u32,
+        ) -> Vec<PropertyValuation> {
+            self.get_historical_valuations(property_id, limit)
+        }
+
+        #[ink(message)]
+        fn get_market_volatility(
+            &self,
+            property_type: PropertyType,
+            location: String,
+        ) -> Result<VolatilityMetrics, OracleError> {
+            self.get_market_volatility(property_type, location)
+        }
+    }
+
+    /// Implementation of the OracleRegistry trait from propchain-traits
+    impl propchain_traits::OracleRegistry for PropertyValuationOracle {
+        #[ink(message)]
+        fn add_source(&mut self, source: OracleSource) -> Result<(), OracleError> {
+            self.add_oracle_source(source)
+        }
+
+        #[ink(message)]
+        fn remove_source(&mut self, source_id: String) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            self.oracle_sources.remove(&source_id);
+            self.active_sources.retain(|id| id != &source_id);
+            Ok(())
+        }
+
+        #[ink(message)]
+        fn update_reputation(
+            &mut self,
+            source_id: String,
+            success: bool,
+        ) -> Result<(), OracleError> {
+            self.update_source_reputation(source_id, success)
+        }
+
+        #[ink(message)]
+        fn get_reputation(&self, source_id: String) -> Option<u32> {
+            self.source_reputations.get(&source_id)
+        }
+
+        #[ink(message)]
+        fn slash_source(
+            &mut self,
+            source_id: String,
+            penalty_amount: u128,
+        ) -> Result<(), OracleError> {
+            self.slash_source(source_id, penalty_amount)
+        }
+
+        #[ink(message)]
+        fn detect_anomalies(&self, property_id: u64, new_valuation: u128) -> bool {
+            self.is_anomaly(property_id, new_valuation)
+        }
+    }
+
+    impl Default for PropertyValuationOracle {
+        fn default() -> Self {
+            Self::new(AccountId::from([0x0; 32]))
+        }
+    }
+}
+
+// Re-export the contract and error type
+pub use propchain_traits::OracleError;
+
+#[cfg(test)]
+mod oracle_tests {
+    use super::*;
+    // use ink::codegen::env::Env; // Removed invalid import
+    use crate::propchain_oracle::PropertyValuationOracle;
+    use ink::env::{test, DefaultEnvironment};
+
+    fn setup_oracle() -> PropertyValuationOracle {
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        PropertyValuationOracle::new(accounts.alice)
+    }
+
+    #[ink::test]
+    fn test_new_oracle_works() {
+        let oracle = setup_oracle();
+        assert_eq!(oracle.active_sources.len(), 0);
+        assert_eq!(oracle.min_sources_required, 2);
+    }
+
+    #[ink::test]
+    fn test_add_oracle_source_works() {
+        let mut oracle = setup_oracle();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        let source = OracleSource {
+            id: "chainlink_feed".to_string(),
+            source_type: OracleSourceType::Chainlink,
+            address: accounts.bob,
+            is_active: true,
+            weight: 50,
+            last_updated: ink::env::block_timestamp::<DefaultEnvironment>(),
+        };
+
+        assert!(oracle.add_oracle_source(source).is_ok());
+        assert_eq!(oracle.active_sources.len(), 1);
+        assert_eq!(oracle.active_sources[0], "chainlink_feed");
+    }
+
+    #[ink::test]
+    fn test_unauthorized_add_source_fails() {
+        let mut oracle = setup_oracle();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        // Switch to non-admin caller
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+
+        let source = OracleSource {
+            id: "chainlink_feed".to_string(),
+            source_type: OracleSourceType::Chainlink,
+            address: accounts.bob,
+            is_active: true,
+            weight: 50,
+            last_updated: ink::env::block_timestamp::<DefaultEnvironment>(),
+        };
+
+        assert_eq!(
+            oracle.add_oracle_source(source),
+            Err(OracleError::Unauthorized)
+        );
+    }
+
+    #[ink::test]
+    fn test_update_property_valuation_works() {
+        let mut oracle = setup_oracle();
+
+        let valuation = PropertyValuation {
+            property_id: 1,
+            valuation: 500000, // $500,000
+            confidence_score: 85,
+            sources_used: 3,
+            last_updated: ink::env::block_timestamp::<DefaultEnvironment>(),
+            valuation_method: ValuationMethod::MarketData,
+        };
+
+        assert!(oracle
+            .update_property_valuation(1, valuation.clone())
+            .is_ok());
+
+        let retrieved = oracle.get_property_valuation(1);
+        assert!(retrieved.is_ok());
+        assert_eq!(
+            retrieved.expect("Valuation should exist after update"),
+            valuation
+        );
+    }
+
+    #[ink::test]
+    fn test_get_nonexistent_valuation_fails() {
+        let oracle = setup_oracle();
+        assert_eq!(
+            oracle.get_property_valuation(999),
+            Err(OracleError::PropertyNotFound)
+        );
+    }
+
+    #[ink::test]
+    fn test_set_price_alert_works() {
+        let mut oracle = setup_oracle();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        assert!(oracle.set_price_alert(1, 5, accounts.bob).is_ok());
+
+        let alerts = oracle.price_alerts.get(&1).unwrap_or_default();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].threshold_percentage, 5);
+        assert_eq!(alerts[0].alert_address, accounts.bob);
+    }
+
+    #[ink::test]
+    fn test_calculate_percentage_change() {
+        let oracle = setup_oracle();
+
+        // Test 10% increase
+        assert_eq!(oracle.calculate_percentage_change(100, 110), 10);
+
+        // Test 20% decrease
+        assert_eq!(oracle.calculate_percentage_change(100, 80), 20);
+
+        // Test no change
+        assert_eq!(oracle.calculate_percentage_change(100, 100), 0);
+
+        // Test zero old value
+        assert_eq!(oracle.calculate_percentage_change(0, 100), 0);
+    }
+
+    #[ink::test]
+    fn test_aggregate_prices_works() {
+        let mut oracle = setup_oracle();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        // Register oracle sources so get_source_weight succeeds
+        for (id, weight) in &[("source1", 50u32), ("source2", 50u32), ("source3", 50u32)] {
+            oracle
+                .add_oracle_source(OracleSource {
+                    id: id.to_string(),
+                    source_type: OracleSourceType::Manual,
+                    address: accounts.bob,
+                    is_active: true,
+                    weight: *weight,
+                    last_updated: ink::env::block_timestamp::<DefaultEnvironment>(),
+                })
+                .expect("Oracle source registration should succeed in test");
+        }
+
+        let prices = vec![
+            PriceData {
+                price: 100,
+                timestamp: ink::env::block_timestamp::<DefaultEnvironment>(),
+                source: "source1".to_string(),
+            },
+            PriceData {
+                price: 105,
+                timestamp: ink::env::block_timestamp::<DefaultEnvironment>(),
+                source: "source2".to_string(),
+            },
+            PriceData {
+                price: 98,
+                timestamp: ink::env::block_timestamp::<DefaultEnvironment>(),
+                source: "source3".to_string(),
+            },
+        ];
+
+        let result = oracle.aggregate_prices(&prices);
         assert!(result.is_ok());
 
-        // Test idempotency - second init should fail
-        let result2 = contract.initialize(env.clone(), admin);
-        assert_eq!(result2, Err(OracleError::AlreadyInitialized));
+        let aggregated = result.expect("Price aggregation should succeed in test");
+        // Should be close to the weighted average of 100, 105, 98 ≈ 101
+        assert!((98..=105).contains(&aggregated));
     }
 
-    #[test]
-    fn test_validation_thresholds() {
-        let env = Env::default();
-        let admin = Address::random(&env);
+    #[ink::test]
+    fn test_filter_outliers_works() {
+        let oracle = setup_oracle();
 
-        OracleContract {}.initialize(env.clone(), admin.clone()).unwrap();
+        // 5 tightly-clustered values + 1 extreme outlier.
+        // With these values: mean ≈ 250, std_dev ≈ 335.
+        // 1000's deviation (750) > 2 * 335 (670), so it is filtered.
+        // The 5 normal values are all within 2σ and are kept.
+        let prices = vec![
+            PriceData {
+                price: 98,
+                timestamp: ink::env::block_timestamp::<DefaultEnvironment>(),
+                source: "source1".to_string(),
+            },
+            PriceData {
+                price: 99,
+                timestamp: ink::env::block_timestamp::<DefaultEnvironment>(),
+                source: "source2".to_string(),
+            },
+            PriceData {
+                price: 100,
+                timestamp: ink::env::block_timestamp::<DefaultEnvironment>(),
+                source: "source3".to_string(),
+            },
+            PriceData {
+                price: 101,
+                timestamp: ink::env::block_timestamp::<DefaultEnvironment>(),
+                source: "source4".to_string(),
+            },
+            PriceData {
+                price: 102,
+                timestamp: ink::env::block_timestamp::<DefaultEnvironment>(),
+                source: "source5".to_string(),
+            },
+            PriceData {
+                price: 1000, // True outlier: ~2.2 sigma from mean
+                timestamp: ink::env::block_timestamp::<DefaultEnvironment>(),
+                source: "source6".to_string(),
+            },
+        ];
 
-        // Get default thresholds
-        let thresholds = OracleContract {}.get_thresholds(env.clone()).unwrap();
-
-        assert_eq!(thresholds.min_submissions, DEFAULT_MIN_SUBMISSIONS);
-        assert_eq!(thresholds.majority_threshold_percent, DEFAULT_MAJORITY_THRESHOLD);
+        let filtered = oracle.filter_outliers(&prices);
+        // The 1000 outlier should be filtered, leaving the 5 normal prices
+        assert_eq!(filtered.len(), 5);
+        assert!(filtered.iter().all(|p| p.price < 200));
     }
 
-    #[test]
-    fn test_detect_outliers() {
-        let env = Env::default();
+    #[ink::test]
+    fn test_calculate_confidence_score() {
+        let oracle = setup_oracle();
 
-        let mut values = Vec::new(&env);
-        values.push_back(100i128);
-        values.push_back(102i128);
-        values.push_back(101i128);
-        values.push_back(500i128); // Outlier
+        let prices = vec![
+            PriceData {
+                price: 100,
+                timestamp: ink::env::block_timestamp::<DefaultEnvironment>(),
+                source: "source1".to_string(),
+            },
+            PriceData {
+                price: 102,
+                timestamp: ink::env::block_timestamp::<DefaultEnvironment>(),
+                source: "source2".to_string(),
+            },
+            PriceData {
+                price: 98,
+                timestamp: ink::env::block_timestamp::<DefaultEnvironment>(),
+                source: "source3".to_string(),
+            },
+        ];
 
-        let outliers = detect_outliers(&values, 15); // 15% deviation
+        let score = oracle.calculate_confidence_score(&prices);
+        assert!(score.is_ok());
 
-        assert_eq!(outliers.get(0), false); // 100
-        assert_eq!(outliers.get(1), false); // 102
-        assert_eq!(outliers.get(2), false); // 101
-        assert_eq!(outliers.get(3), true); // 500 is outlier
+        let score = score.expect("Confidence score calculation should succeed in test");
+        // Should be reasonably high due to low variance and multiple sources
+        assert!(score > 50);
     }
 
-    #[test]
-    fn test_calculate_median() {
-        let env = Env::default();
+    #[ink::test]
+    fn test_set_location_adjustment_works() {
+        let mut oracle = setup_oracle();
 
-        let mut values = Vec::new(&env);
-        values.push_back(10i128);
-        values.push_back(20i128);
-        values.push_back(30i128);
+        let adjustment = LocationAdjustment {
+            location_code: "NYC_MANHATTAN".to_string(),
+            adjustment_percentage: 15, // 15% premium
+            last_updated: ink::env::block_timestamp::<DefaultEnvironment>(),
+            confidence_score: 90,
+        };
 
-        let median = calculate_median(&values);
-        assert_eq!(median, 20i128);
+        assert!(oracle.set_location_adjustment(adjustment.clone()).is_ok());
+
+        let stored = oracle.location_adjustments.get(&adjustment.location_code);
+        assert!(stored.is_some());
+        assert_eq!(
+            stored.expect("Location adjustment should exist after setting"),
+            adjustment
+        );
     }
 
-    #[test]
-    fn test_calculate_weighted_average() {
-        let env = Env::default();
+    #[ink::test]
+    fn test_get_comparable_properties_works() {
+        let oracle = setup_oracle();
 
-        let mut values = Vec::new(&env);
-        values.push_back(10i128);
-        values.push_back(20i128);
-        values.push_back(30i128);
-
-        let avg = calculate_weighted_average(&values);
-        assert_eq!(avg, 20i128);
+        // Test with empty cache
+        let comparables = oracle.get_comparable_properties(1, 10);
+        assert_eq!(comparables.len(), 0);
     }
 
-    #[test]
-    fn test_is_data_stale() {
-        let current = 1000u64;
-        let threshold = 3600u64;
+    #[ink::test]
+    fn test_get_historical_valuations_works() {
+        let oracle = setup_oracle();
 
-        // Fresh data
-        assert!(!is_data_stale(900, current, threshold));
-
-        // Stale data
-        assert!(is_data_stale(100, current, threshold));
-
-        // Future data (invalid)
-        assert!(is_data_stale(1100, current, threshold));
-    }
-}
-
-// ============================================================================
-// Extended Test Suite for Comprehensive Oracle Validation
-// ============================================================================
-
-#[cfg(any())]
-mod oracle_consensus_tests {
-    use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
-
-    #[test]
-    fn test_oracle_disagreement_scenario() {
-        // Scenario: Multiple oracles submit different values for same data point
-        let env = Env::default();
-        let admin = Address::random(&env);
-        let oracle1 = Address::random(&env);
-        let oracle2 = Address::random(&env);
-        let oracle3 = Address::random(&env);
-
-        let contract = OracleContract {};
-        contract.initialize(env.clone(), admin.clone()).unwrap();
-
-        // Simulate three oracles with slightly different values
-        let data_id = 1u64;
-
-        // Oracle 1 submits value 100
-        let result1 = contract.submit_oracle_data(env.clone(), data_id, 100i128);
-        assert!(result1.is_ok());
-
-        // Oracle 2 submits value 102 (within 15% deviation)
-        let result2 = contract.submit_oracle_data(env.clone(), data_id, 102i128);
-        assert!(result2.is_ok());
-
-        // Oracle 3 submits value 101 (within 15% deviation)
-        let result3 = contract.submit_oracle_data(env.clone(), data_id, 101i128);
-        assert!(result3.is_ok());
-
-        // Consensus should be reached with median of 101
-        let resolved = contract.resolve_oracle_data(env.clone(), data_id);
-        assert!(resolved.is_ok());
-        let oracle_data = resolved.unwrap();
-
-        // Median of [100, 102, 101] = 101
-        assert_eq!(oracle_data.consensus_value, 101i128);
-        assert_eq!(oracle_data.submission_count, 3u32);
-        assert_eq!(oracle_data.consensus_percentage, 100u32);
-        assert_eq!(oracle_data.included_submissions, 3u32);
+        // Test with no history
+        let history = oracle.get_historical_valuations(1, 10);
+        assert_eq!(history.len(), 0);
     }
 
-    #[test]
-    fn test_oracle_outlier_rejection() {
-        // Scenario: One oracle submits an outlier, should be detected and rejected
-        let env = Env::default();
-        let admin = Address::random(&env);
+    #[ink::test]
+    fn test_insufficient_sources_error() {
+        let oracle = setup_oracle();
 
-        let contract = OracleContract {};
-        contract.initialize(env.clone(), admin.clone()).unwrap();
+        let prices = vec![PriceData {
+            price: 100,
+            timestamp: ink::env::block_timestamp::<DefaultEnvironment>(),
+            source: "source1".to_string(),
+        }];
 
-        let data_id = 2u64;
-
-        // Valid submissions
-        let _result1 = contract.submit_oracle_data(env.clone(), data_id, 100i128);
-        let _result2 = contract.submit_oracle_data(env.clone(), data_id, 101i128);
-        let _result3 = contract.submit_oracle_data(env.clone(), data_id, 102i128);
-
-        // Outlier submission (far outside 15% deviation range)
-        let _result4 = contract.submit_oracle_data(env.clone(), data_id, 500i128);
-
-        let resolved = contract.resolve_oracle_data(env.clone(), data_id);
-        assert!(resolved.is_ok());
-        let oracle_data = resolved.unwrap();
-
-        // Should have 3 valid submissions, 1 rejected
-        assert_eq!(oracle_data.submission_count, 4u32);
-        assert_eq!(oracle_data.included_submissions, 3u32);
-        assert_eq!(oracle_data.rejected_submissions, 1u32);
-        assert!(oracle_data.consensus_percentage >= 75u32); // 3 out of 4
+        // With min_sources_required = 2, this should fail
+        let result = oracle.aggregate_prices(&prices);
+        assert_eq!(result, Err(OracleError::InsufficientSources));
     }
 
-    #[test]
-    fn test_insufficient_submissions() {
-        // Scenario: Fewer submissions than minimum required
-        let env = Env::default();
-        let admin = Address::random(&env);
+    #[ink::test]
+    fn test_source_reputation_works() {
+        let mut oracle = setup_oracle();
+        let source_id = "source1".to_string();
 
-        let contract = OracleContract {};
-        contract.initialize(env.clone(), admin.clone()).unwrap();
-
-        let data_id = 3u64;
-
-        // Submit only one oracle value
-        let _result = contract.submit_oracle_data(env.clone(), data_id, 100i128);
-
-        // Try to resolve - should fail with insufficient submissions
-        let resolved = contract.resolve_oracle_data(env.clone(), data_id);
-        assert_eq!(resolved, Err(OracleError::InsufficientSubmissions));
-    }
-
-    #[test]
-    fn test_stale_data_rejection() {
-        // Scenario: Oracle data is too old and should be rejected
-        let env = Env::default();
-        let admin = Address::random(&env);
-
-        let contract = OracleContract {};
-        contract.initialize(env.clone(), admin.clone()).unwrap();
-
-        // Set a very short staleness threshold
-        let _result = contract.set_thresholds(
-            env.clone(),
-            3u32,
-            66u32,
-            15i128,
-            100u64, // Only 100 seconds before stale
+        // Initial reputation should be 500
+        assert!(oracle
+            .update_source_reputation(source_id.clone(), true)
+            .is_ok());
+        assert_eq!(
+            oracle
+                .source_reputations
+                .get(&source_id)
+                .expect("Source reputation should exist after update"),
+            510
         );
 
-        let data_id = 4u64;
-
-        // Simulate oracle data submission at time 100
-        env.ledger().with_timestamp(100);
-        let _result = contract.submit_oracle_data(env.clone(), data_id, 100i128);
-        let _result = contract.submit_oracle_data(env.clone(), data_id, 101i128);
-        let _result = contract.submit_oracle_data(env.clone(), data_id, 102i128);
-
-        // Try to resolve - should succeed at current time
-        let resolved1 = contract.resolve_oracle_data(env.clone(), data_id);
-        assert!(resolved1.is_ok());
-
-        // Simulate time passing beyond staleness threshold
-        env.ledger().with_timestamp(250); // 150 seconds later, exceeds 100 second threshold
-
-        // Create new data point at future timestamp
-        let data_id2 = 5u64;
-        let _result = contract.submit_oracle_data(env.clone(), data_id2, 100i128);
-        let _result = contract.submit_oracle_data(env.clone(), data_id2, 101i128);
-        let _result = contract.submit_oracle_data(env.clone(), data_id2, 102i128);
-
-        // This should fail because all submissions are stale
-        let resolved2 = contract.resolve_oracle_data(env.clone(), data_id2);
-        assert_eq!(resolved2, Err(OracleError::StaleData));
-    }
-
-    #[test]
-    fn test_duplicate_oracle_submission() {
-        // Scenario: Same oracle tries to submit twice for same data point
-        let env = Env::default();
-        let admin = Address::random(&env);
-        let oracle = Address::random(&env);
-
-        let contract = OracleContract {};
-        contract.initialize(env.clone(), admin.clone()).unwrap();
-
-        let data_id = 6u64;
-
-        // First submission should succeed
-        let result1 = contract.submit_oracle_data(env.clone(), data_id, 100i128);
-        assert!(result1.is_ok());
-
-        // Second submission from same oracle should fail
-        let result2 = contract.submit_oracle_data(env.clone(), data_id, 102i128);
-        assert_eq!(result2, Err(OracleError::DuplicateSubmission));
-    }
-
-    #[test]
-    fn test_consensus_threshold_enforcement() {
-        // Scenario: Test that consensus threshold is properly enforced
-        let env = Env::default();
-        let admin = Address::random(&env);
-
-        let contract = OracleContract {};
-        contract.initialize(env.clone(), admin.clone()).unwrap();
-
-        // Set high majority threshold (80%)
-        let _result = contract.set_thresholds(
-            env.clone(),
-            3u32,
-            80u32, // 80% required
-            15i128,
-            3600u64,
+        // Test penalty
+        assert!(oracle
+            .update_source_reputation(source_id.clone(), false)
+            .is_ok());
+        assert_eq!(
+            oracle
+                .source_reputations
+                .get(&source_id)
+                .expect("Source reputation should exist after update"),
+            460
         );
-
-        let data_id = 7u64;
-
-        // Submit 3 values where 2 match and 1 is outlier
-        let _result1 = contract.submit_oracle_data(env.clone(), data_id, 100i128);
-        let _result2 = contract.submit_oracle_data(env.clone(), data_id, 101i128);
-        let _result3 = contract.submit_oracle_data(env.clone(), data_id, 500i128); // Outlier
-
-        // With only 2 valid submissions out of 3 (66%), below 80% threshold
-        let resolved = contract.resolve_oracle_data(env.clone(), data_id);
-        assert_eq!(resolved, Err(OracleError::ConsensusNotReached));
     }
 
-    #[test]
-    fn test_median_calculation() {
-        let env = Env::default();
+    #[ink::test]
+    fn test_slashing_works() {
+        let mut oracle = setup_oracle();
+        let source_id = "source1".to_string();
 
-        // Odd number of values
-        let mut values_odd = Vec::new(&env);
-        values_odd.push_back(10i128);
-        values_odd.push_back(30i128);
-        values_odd.push_back(20i128);
+        oracle.source_stakes.insert(&source_id, &1000);
+        assert!(oracle.slash_source(source_id.clone(), 100).is_ok());
 
-        let median_odd = calculate_median(&values_odd);
-        assert_eq!(median_odd, 20i128);
-
-        // Even number of values
-        let mut values_even = Vec::new(&env);
-        values_even.push_back(10i128);
-        values_even.push_back(20i128);
-        values_even.push_back(30i128);
-        values_even.push_back(40i128);
-
-        let median_even = calculate_median(&values_even);
-        assert_eq!(median_even, 25i128); // (20 + 30) / 2
-    }
-
-    #[test]
-    fn test_weighted_average_calculation() {
-        let env = Env::default();
-
-        let mut values = Vec::new(&env);
-        values.push_back(100i128);
-        values.push_back(200i128);
-        values.push_back(300i128);
-
-        let avg = calculate_weighted_average(&values);
-        assert_eq!(avg, 200i128);
-    }
-
-    #[test]
-    fn test_outlier_detection_edge_cases() {
-        let env = Env::default();
-
-        // Single value - no outliers
-        let mut values = Vec::new(&env);
-        values.push_back(100i128);
-
-        let outliers = detect_outliers(&values, 15);
-        assert_eq!(outliers.len(), 1);
-        assert_eq!(outliers.get(0), false);
-
-        // Two values - no outliers with current implementation
-        let mut values2 = Vec::new(&env);
-        values2.push_back(100i128);
-        values2.push_back(200i128);
-
-        let outliers2 = detect_outliers(&values2, 15);
-        assert_eq!(outliers2.len(), 2);
-        assert_eq!(outliers2.get(0), false);
-        assert_eq!(outliers2.get(1), false);
-    }
-
-    #[test]
-    fn test_threshold_validation() {
-        let env = Env::default();
-        let admin = Address::random(&env);
-
-        let contract = OracleContract {};
-        contract.initialize(env.clone(), admin.clone()).unwrap();
-
-        // Try to set invalid threshold (>100%)
-        let result = contract.set_thresholds(
-            env.clone(),
-            3u32,
-            150u32, // Invalid: > 100%
-            15i128,
-            3600u64,
+        assert_eq!(
+            oracle
+                .source_stakes
+                .get(&source_id)
+                .expect("Source stake should exist after slashing"),
+            900
         );
-        assert_eq!(result, Err(OracleError::InvalidThreshold));
+        // Reputation should also decrease
+        assert!(
+            oracle
+                .source_reputations
+                .get(&source_id)
+                .expect("Source reputation should exist after slashing")
+                < 500
+        );
     }
 
-    #[test]
-    fn test_oracle_data_retrieval() {
-        let env = Env::default();
-        let admin = Address::random(&env);
+    #[ink::test]
+    fn test_anomaly_detection_works() {
+        let mut oracle = setup_oracle();
+        let property_id = 1;
 
-        let contract = OracleContract {};
-        contract.initialize(env.clone(), admin.clone()).unwrap();
+        let valuation = PropertyValuation {
+            property_id,
+            valuation: 100000,
+            confidence_score: 90,
+            sources_used: 3,
+            last_updated: 0,
+            valuation_method: ValuationMethod::Automated,
+        };
 
-        let data_id = 10u64;
+        oracle.property_valuations.insert(&property_id, &valuation);
 
-        // Submit and resolve
-        let _result1 = contract.submit_oracle_data(env.clone(), data_id, 100i128);
-        let _result2 = contract.submit_oracle_data(env.clone(), data_id, 101i128);
-        let _result3 = contract.submit_oracle_data(env.clone(), data_id, 102i128);
+        // Normal price change (5%)
+        assert!(!oracle.is_anomaly(property_id, 105000));
 
-        let resolved = contract.resolve_oracle_data(env.clone(), data_id).unwrap();
-
-        // Retrieve stored oracle data
-        let stored = contract.get_oracle_data(env.clone(), data_id).unwrap();
-
-        assert_eq!(stored.data_id, data_id);
-        assert_eq!(stored.consensus_value, resolved.consensus_value);
-        assert_eq!(stored.submission_count, resolved.submission_count);
+        // Anomaly price change (25%)
+        assert!(oracle.is_anomaly(property_id, 130000));
     }
 
-    #[test]
-    fn test_multiple_independent_data_points() {
-        // Scenario: Multiple oracle data points with independent consensus
-        let env = Env::default();
-        let admin = Address::random(&env);
+    #[ink::test]
+    fn test_batch_request_works() {
+        let mut oracle = setup_oracle();
+        let property_ids = vec![1, 2, 3];
 
-        let contract = OracleContract {};
-        contract.initialize(env.clone(), admin.clone()).unwrap();
+        let result = oracle.batch_request_valuations(property_ids);
+        assert!(result.is_ok());
+        let request_ids = result.expect("Batch request should succeed in test");
+        assert_eq!(request_ids.len(), 3);
 
-        // Data point 1
-        let _r1_1 = contract.submit_oracle_data(env.clone(), 1u64, 100i128);
-        let _r1_2 = contract.submit_oracle_data(env.clone(), 1u64, 101i128);
-        let _r1_3 = contract.submit_oracle_data(env.clone(), 1u64, 102i128);
-
-        // Data point 2
-        let _r2_1 = contract.submit_oracle_data(env.clone(), 2u64, 200i128);
-        let _r2_2 = contract.submit_oracle_data(env.clone(), 2u64, 201i128);
-        let _r2_3 = contract.submit_oracle_data(env.clone(), 2u64, 202i128);
-
-        // Resolve both independently
-        let resolved1 = contract.resolve_oracle_data(env.clone(), 1u64).unwrap();
-        let resolved2 = contract.resolve_oracle_data(env.clone(), 2u64).unwrap();
-
-        assert_eq!(resolved1.consensus_value, 101i128);
-        assert_eq!(resolved2.consensus_value, 201i128);
-        assert_eq!(resolved1.submission_count, 3u32);
-        assert_eq!(resolved2.submission_count, 3u32);
-    }
-
-    #[test]
-    fn test_pause_functionality() {
-        let env = Env::default();
-        let admin = Address::random(&env);
-
-        let contract = OracleContract {};
-        contract.initialize(env.clone(), admin.clone()).unwrap();
-
-        // Pause the contract
-        let _result = contract.set_paused(env.clone(), true);
-
-        // Attempts to submit should fail
-        let submit_result = contract.submit_oracle_data(env.clone(), 1u64, 100i128);
-        assert_eq!(submit_result, Err(OracleError::Paused));
-
-        // Unpause
-        let _result = contract.set_paused(env.clone(), false);
-
-        // Should work again
-        let submit_result2 = contract.submit_oracle_data(env.clone(), 1u64, 100i128);
-        assert!(submit_result2.is_ok());
+        assert!(oracle.pending_requests.get(&1).is_some());
+        assert!(oracle.pending_requests.get(&2).is_some());
+        assert!(oracle.pending_requests.get(&3).is_some());
     }
 }
