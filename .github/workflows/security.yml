@@ -13,6 +13,9 @@ jobs:
     name: Automated Security Pipeline
     runs-on: ubuntu-latest
     continue-on-error: true
+    defaults:
+      run:
+        working-directory: stellar-insured-contracts
     steps:
     - uses: actions/checkout@v4
 
@@ -69,12 +72,15 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: security-report
-        path: security-report.json
+        path: stellar-insured-contracts/security-report.json
 
   formal-verification:
     name: Formal Verification (Kani)
     runs-on: ubuntu-latest
     continue-on-error: true
+    defaults:
+      run:
+        working-directory: stellar-insured-contracts
     steps:
     - uses: actions/checkout@v4
 
@@ -99,6 +105,9 @@ jobs:
     name: Regression Testing
     runs-on: ubuntu-latest
     continue-on-error: true
+    defaults:
+      run:
+        working-directory: stellar-insured-contracts
     steps:
     - uses: actions/checkout@v4
     
@@ -123,7 +132,7 @@ jobs:
       uses: aquasecurity/trivy-action@master
       with:
         scan-type: 'fs'
-        scan-ref: '.'
+        scan-ref: 'stellar-insured-contracts'
         format: 'table'
         exit-code: '1'
         ignore-unfixed: true

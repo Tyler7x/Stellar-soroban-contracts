@@ -4,17 +4,17 @@ on:
   push:
     branches: [ main, develop, master ]
     paths:
-      - 'contracts/lib/**'
-      - 'contracts/traits/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
+      - 'stellar-insured-contracts/contracts/lib/**'
+      - 'stellar-insured-contracts/contracts/traits/**'
+      - 'stellar-insured-contracts/Cargo.toml'
+      - 'stellar-insured-contracts/Cargo.lock'
   pull_request:
     branches: [ main, develop, master ]
     paths:
-      - 'contracts/lib/**'
-      - 'contracts/traits/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
+      - 'stellar-insured-contracts/contracts/lib/**'
+      - 'stellar-insured-contracts/contracts/traits/**'
+      - 'stellar-insured-contracts/Cargo.toml'
+      - 'stellar-insured-contracts/Cargo.lock'
   workflow_dispatch:
 
 env:
@@ -24,6 +24,9 @@ jobs:
   test:
     name: PropertyRegistry Unit Tests
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: stellar-insured-contracts
     steps:
       - uses: actions/checkout@v4
 
@@ -36,11 +39,11 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            stellar-insured-contracts/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('stellar-insured-contracts/**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
       - name: Run PropertyRegistry unit tests
-        working-directory: contracts/lib
+        working-directory: stellar-insured-contracts/contracts/lib
         run: cargo test --lib

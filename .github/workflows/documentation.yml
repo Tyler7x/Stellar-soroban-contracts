@@ -4,17 +4,20 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'contracts/**'
-      - 'docs/**'
+      - 'stellar-insured-contracts/contracts/**'
+      - 'stellar-insured-contracts/docs/**'
   pull_request:
     branches: [ main ]
     paths:
-      - 'contracts/**'
-      - 'docs/**'
+      - 'stellar-insured-contracts/contracts/**'
+      - 'stellar-insured-contracts/docs/**'
 
 jobs:
   verify-docs:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: stellar-insured-contracts
     steps:
       - uses: actions/checkout@v4
 
@@ -29,11 +32,11 @@ jobs:
         with:
           use-quiet-mode: 'yes'
           use-verbose-mode: 'no'
-          folder-path: 'docs'
+          folder-path: 'stellar-insured-contracts/docs'
         continue-on-error: true
 
       - name: Archive documentation
         uses: actions/upload-artifact@v4
         with:
           name: contract-docs
-          path: target/doc
+          path: stellar-insured-contracts/target/doc
