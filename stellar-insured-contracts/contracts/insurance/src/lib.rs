@@ -44,7 +44,13 @@ mod propchain_insurance {
         EvidenceNonceEmpty,
         EvidenceInvalidUriScheme,
         EvidenceInvalidHashLength,
+        ZeroAmount,
+        InsufficientStake,
+        InsufficientPoolLiquidity,
     }
+
+    /// Fixed-point precision for [`RiskPool::accumulated_reward_per_share`] (1e18).
+    const REWARD_PRECISION: u128 = 1_000_000_000_000_000_000;
 
     // =========================================================================
     // DATA TYPES
@@ -201,6 +207,10 @@ mod propchain_insurance {
         pub reinsurance_threshold: u128, // Claim size above which reinsurance kicks in
         pub created_at: u64,
         pub is_active: bool,
+        /// Sum of LP stakes; denominator for reward-per-share accrual.
+        pub total_provider_stake: u128,
+        /// Scaled accumulated rewards per staked unit ([`REWARD_PRECISION`] fixed-point).
+        pub accumulated_reward_per_share: u128,
     }
 
     #[derive(
@@ -300,11 +310,10 @@ mod propchain_insurance {
     pub struct PoolLiquidityProvider {
         pub provider: AccountId,
         pub pool_id: u64,
-        pub deposited_amount: u128,
-        pub share_percentage: u32, // In basis points (10000 = 100%)
+        pub provider_stake: u128,
+        /// Reward debt in fixed-point units: keeps pending = stake * acc_rps / P - reward_debt.
+        pub reward_debt: u128,
         pub deposited_at: u64,
-        pub last_reward_claim: u64,
-        pub accumulated_rewards: u128,
     }
 
     // =========================================================================
@@ -451,6 +460,52 @@ mod propchain_insurance {
     }
 
     #[ink(event)]
+    pub struct LiquidityDeposited {
+        #[ink(topic)]
+        pool_id: u64,
+        #[ink(topic)]
+        provider: AccountId,
+        amount: u128,
+        accumulated_reward_per_share: u128,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct LiquidityWithdrawn {
+        #[ink(topic)]
+        pool_id: u64,
+        #[ink(topic)]
+        provider: AccountId,
+        principal: u128,
+        rewards_paid: u128,
+        accumulated_reward_per_share: u128,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct RewardsClaimed {
+        #[ink(topic)]
+        pool_id: u64,
+        #[ink(topic)]
+        provider: AccountId,
+        amount: u128,
+        accumulated_reward_per_share: u128,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct RewardsReinvested {
+        #[ink(topic)]
+        pool_id: u64,
+        #[ink(topic)]
+        provider: AccountId,
+        amount: u128,
+        new_stake: u128,
+        accumulated_reward_per_share: u128,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
     pub struct ReinsuranceActivated {
         #[ink(topic)]
         claim_id: u64,
@@ -559,17 +614,22 @@ mod propchain_insurance {
                 reinsurance_threshold,
                 created_at: self.env().block_timestamp(),
                 is_active: true,
+                total_provider_stake: 0,
+                accumulated_reward_per_share: 0,
             };
 
             self.pools.insert(&pool_id, &pool);
             Ok(pool_id)
         }
 
-        /// Provide liquidity to a pool
+        /// Deposit native liquidity into a pool (reward-per-share stake).
         #[ink(message, payable)]
-        pub fn provide_pool_liquidity(&mut self, pool_id: u64) -> Result<(), InsuranceError> {
+        pub fn deposit_liquidity(&mut self, pool_id: u64) -> Result<(), InsuranceError> {
             let caller = self.env().caller();
             let amount = self.env().transferred_value();
+            if amount == 0 {
+                return Err(InsuranceError::ZeroAmount);
+            }
 
             let mut pool = self
                 .pools
@@ -579,42 +639,248 @@ mod propchain_insurance {
                 return Err(InsuranceError::PoolNotFound);
             }
 
-            pool.total_capital += amount;
-            pool.available_capital += amount;
-            self.pools.insert(&pool_id, &pool);
-
-            // Update liquidity provider record
+            let now = self.env().block_timestamp();
             let key = (pool_id, caller);
-            let mut provider =
-                self.liquidity_providers
-                    .get(&key)
-                    .unwrap_or(PoolLiquidityProvider {
-                        provider: caller,
-                        pool_id,
-                        deposited_amount: 0,
-                        share_percentage: 0,
-                        deposited_at: self.env().block_timestamp(),
-                        last_reward_claim: self.env().block_timestamp(),
-                        accumulated_rewards: 0,
-                    });
-            provider.deposited_amount += amount;
+            let mut provider = self.liquidity_providers.get(&key).unwrap_or(PoolLiquidityProvider {
+                provider: caller,
+                pool_id,
+                provider_stake: 0,
+                reward_debt: 0,
+                deposited_at: now,
+            });
+
+            let acc = pool.accumulated_reward_per_share;
+            provider.reward_debt = provider
+                .reward_debt
+                .saturating_add(
+                    amount
+                        .saturating_mul(acc)
+                        .saturating_div(REWARD_PRECISION),
+                );
+            provider.provider_stake = provider.provider_stake.saturating_add(amount);
+
+            pool.total_provider_stake = pool.total_provider_stake.saturating_add(amount);
+            pool.total_capital = pool.total_capital.saturating_add(amount);
+            pool.available_capital = pool.available_capital.saturating_add(amount);
+
+            self.pools.insert(&pool_id, &pool);
             self.liquidity_providers.insert(&key, &provider);
 
-            // Track providers per pool
             let mut providers = self.pool_providers.get(&pool_id).unwrap_or_default();
             if !providers.contains(&caller) {
                 providers.push(caller);
                 self.pool_providers.insert(&pool_id, &providers);
             }
 
+            let timestamp = self.env().block_timestamp();
             self.env().emit_event(PoolCapitalized {
                 pool_id,
                 provider: caller,
                 amount,
-                timestamp: self.env().block_timestamp(),
+                timestamp,
+            });
+            self.env().emit_event(LiquidityDeposited {
+                pool_id,
+                provider: caller,
+                amount,
+                accumulated_reward_per_share: pool.accumulated_reward_per_share,
+                timestamp,
             });
 
             Ok(())
+        }
+
+        /// Legacy entry point: same as [`deposit_liquidity`](Self::deposit_liquidity).
+        #[ink(message, payable)]
+        pub fn provide_pool_liquidity(&mut self, pool_id: u64) -> Result<(), InsuranceError> {
+            self.deposit_liquidity(pool_id)
+        }
+
+        /// Withdraw staked principal; pending rewards are paid out in the same call.
+        #[ink(message)]
+        pub fn withdraw_liquidity(
+            &mut self,
+            pool_id: u64,
+            amount: u128,
+        ) -> Result<(), InsuranceError> {
+            if amount == 0 {
+                return Err(InsuranceError::ZeroAmount);
+            }
+
+            let caller = self.env().caller();
+            let mut pool = self
+                .pools
+                .get(&pool_id)
+                .ok_or(InsuranceError::PoolNotFound)?;
+            if !pool.is_active {
+                return Err(InsuranceError::PoolNotFound);
+            }
+
+            let key = (pool_id, caller);
+            let mut provider = self
+                .liquidity_providers
+                .get(&key)
+                .ok_or(InsuranceError::InsufficientStake)?;
+            if provider.provider_stake < amount {
+                return Err(InsuranceError::InsufficientStake);
+            }
+
+            let acc = pool.accumulated_reward_per_share;
+            let pending =
+                Self::pending_reward_amount(provider.provider_stake, acc, provider.reward_debt);
+            let total_out = pending.saturating_add(amount);
+            if pool.available_capital < total_out {
+                return Err(InsuranceError::InsufficientPoolLiquidity);
+            }
+
+            provider.provider_stake = provider.provider_stake.saturating_sub(amount);
+            provider.reward_debt = Self::synced_reward_debt(provider.provider_stake, acc);
+
+            pool.total_provider_stake = pool.total_provider_stake.saturating_sub(amount);
+            pool.available_capital = pool.available_capital.saturating_sub(total_out);
+            pool.total_capital = pool.total_capital.saturating_sub(amount);
+
+            self.pools.insert(&pool_id, &pool);
+            if provider.provider_stake == 0 {
+                self.liquidity_providers.remove(&key);
+                if let Some(mut accs) = self.pool_providers.get(&pool_id) {
+                    accs.retain(|a| *a != caller);
+                    self.pool_providers.insert(&pool_id, &accs);
+                }
+            } else {
+                self.liquidity_providers.insert(&key, &provider);
+            }
+
+            let timestamp = self.env().block_timestamp();
+            self.env().emit_event(LiquidityWithdrawn {
+                pool_id,
+                provider: caller,
+                principal: amount,
+                rewards_paid: pending,
+                accumulated_reward_per_share: acc,
+                timestamp,
+            });
+
+            if total_out > 0 {
+                self.env()
+                    .transfer(caller, total_out)
+                    .map_err(|_| InsuranceError::TransferFailed)?;
+            }
+
+            Ok(())
+        }
+
+        /// Claim accrued rewards to the caller (checks-effects-interactions).
+        #[ink(message)]
+        pub fn claim_rewards(&mut self, pool_id: u64) -> Result<u128, InsuranceError> {
+            let caller = self.env().caller();
+            let mut pool = self
+                .pools
+                .get(&pool_id)
+                .ok_or(InsuranceError::PoolNotFound)?;
+            if !pool.is_active {
+                return Err(InsuranceError::PoolNotFound);
+            }
+
+            let key = (pool_id, caller);
+            let mut provider = self
+                .liquidity_providers
+                .get(&key)
+                .ok_or(InsuranceError::InsufficientStake)?;
+
+            let acc = pool.accumulated_reward_per_share;
+            let pending =
+                Self::pending_reward_amount(provider.provider_stake, acc, provider.reward_debt);
+            if pending == 0 {
+                return Ok(0);
+            }
+            if pool.available_capital < pending {
+                return Err(InsuranceError::InsufficientPoolLiquidity);
+            }
+
+            provider.reward_debt = Self::synced_reward_debt(provider.provider_stake, acc);
+            pool.available_capital = pool.available_capital.saturating_sub(pending);
+
+            self.pools.insert(&pool_id, &pool);
+            self.liquidity_providers.insert(&key, &provider);
+
+            let timestamp = self.env().block_timestamp();
+            self.env().emit_event(RewardsClaimed {
+                pool_id,
+                provider: caller,
+                amount: pending,
+                accumulated_reward_per_share: acc,
+                timestamp,
+            });
+
+            self.env()
+                .transfer(caller, pending)
+                .map_err(|_| InsuranceError::TransferFailed)?;
+
+            Ok(pending)
+        }
+
+        /// Compound pending rewards into stake (no transfer; updates debt to current index).
+        #[ink(message)]
+        pub fn reinvest_rewards(&mut self, pool_id: u64) -> Result<(), InsuranceError> {
+            let caller = self.env().caller();
+            let mut pool = self
+                .pools
+                .get(&pool_id)
+                .ok_or(InsuranceError::PoolNotFound)?;
+            if !pool.is_active {
+                return Err(InsuranceError::PoolNotFound);
+            }
+
+            let key = (pool_id, caller);
+            let mut provider = self
+                .liquidity_providers
+                .get(&key)
+                .ok_or(InsuranceError::InsufficientStake)?;
+
+            let acc = pool.accumulated_reward_per_share;
+            let pending =
+                Self::pending_reward_amount(provider.provider_stake, acc, provider.reward_debt);
+            if pending == 0 {
+                return Ok(());
+            }
+
+            provider.provider_stake = provider.provider_stake.saturating_add(pending);
+            provider.reward_debt = Self::synced_reward_debt(provider.provider_stake, acc);
+
+            pool.total_provider_stake = pool.total_provider_stake.saturating_add(pending);
+            pool.total_capital = pool.total_capital.saturating_add(pending);
+
+            self.pools.insert(&pool_id, &pool);
+            self.liquidity_providers.insert(&key, &provider);
+
+            let timestamp = self.env().block_timestamp();
+            self.env().emit_event(RewardsReinvested {
+                pool_id,
+                provider: caller,
+                amount: pending,
+                new_stake: provider.provider_stake,
+                accumulated_reward_per_share: acc,
+                timestamp,
+            });
+
+            Ok(())
+        }
+
+        /// View: pending reward amount for an account (fixed-point accurate vs on-chain claim).
+        #[ink(message)]
+        pub fn get_pending_rewards(&self, pool_id: u64, provider: AccountId) -> u128 {
+            let Some(pool) = self.pools.get(&pool_id) else {
+                return 0;
+            };
+            let Some(p) = self.liquidity_providers.get(&(pool_id, provider)) else {
+                return 0;
+            };
+            Self::pending_reward_amount(
+                p.provider_stake,
+                pool.accumulated_reward_per_share,
+                p.reward_debt,
+            )
         }
 
         // =====================================================================
@@ -780,6 +1046,7 @@ mod propchain_insurance {
             pool.total_premiums_collected += pool_share;
             pool.available_capital += pool_share;
             pool.active_policies += 1;
+            Self::apply_reward_accrual(&mut pool, pool_share);
             self.pools.insert(&pool_id, &pool);
 
             // Create policy
@@ -1389,6 +1656,33 @@ mod propchain_insurance {
         // =====================================================================
         // INTERNAL HELPERS
         // =====================================================================
+
+        #[inline]
+        fn pending_reward_amount(stake: u128, acc_rps: u128, reward_debt: u128) -> u128 {
+            let earned = stake
+                .saturating_mul(acc_rps)
+                .saturating_div(REWARD_PRECISION);
+            earned.saturating_sub(reward_debt)
+        }
+
+        #[inline]
+        fn synced_reward_debt(stake: u128, acc_rps: u128) -> u128 {
+            stake
+                .saturating_mul(acc_rps)
+                .saturating_div(REWARD_PRECISION)
+        }
+
+        /// Increase `accumulated_reward_per_share` for `reward_amount` already credited to
+        /// `available_capital` (e.g. premium `pool_share`).
+        fn apply_reward_accrual(pool: &mut RiskPool, reward_amount: u128) {
+            if reward_amount == 0 || pool.total_provider_stake == 0 {
+                return;
+            }
+            let inc = reward_amount
+                .saturating_mul(REWARD_PRECISION)
+                .saturating_div(pool.total_provider_stake);
+            pool.accumulated_reward_per_share = pool.accumulated_reward_per_share.saturating_add(inc);
+        }
 
         fn ensure_admin(&self) -> Result<(), InsuranceError> {
             if self.env().caller() != self.admin {
@@ -2351,8 +2645,195 @@ mod insurance_tests {
         let provider = contract
             .get_liquidity_provider(pool_id, accounts.bob)
             .unwrap();
-        assert_eq!(provider.deposited_amount, 5_000_000_000_000u128);
+        assert_eq!(provider.provider_stake, 5_000_000_000_000u128);
         assert_eq!(provider.pool_id, pool_id);
+    }
+
+    #[ink::test]
+    fn test_deposit_liquidity_tracks_total_provider_stake() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let pool_id = create_pool(&mut contract);
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(3_000u128);
+        contract.deposit_liquidity(pool_id).unwrap();
+        let pool = contract.get_pool(pool_id).unwrap();
+        assert_eq!(pool.total_provider_stake, 3_000);
+        assert_eq!(pool.accumulated_reward_per_share, 0);
+    }
+
+    #[ink::test]
+    fn test_premium_splits_rewards_evenly_between_two_lps() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let pool_id = create_pool(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(1_000u128);
+        contract.deposit_liquidity(pool_id).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        test::set_value_transferred::<DefaultEnvironment>(1_000u128);
+        contract.deposit_liquidity(pool_id).unwrap();
+
+        add_risk_assessment(&mut contract, 1);
+        let calc = contract
+            .calculate_premium(1, 100u128, CoverageType::Fire)
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.eve);
+        test::set_value_transferred::<DefaultEnvironment>(calc.annual_premium);
+        contract
+            .create_policy(
+                1,
+                CoverageType::Fire,
+                100u128,
+                pool_id,
+                86_400 * 365,
+                "ipfs://p".into(),
+            )
+            .unwrap();
+
+        let fee = calc.annual_premium.saturating_mul(200u128) / 10_000u128;
+        let pool_share = calc.annual_premium.saturating_sub(fee);
+
+        let bob_p = contract.get_pending_rewards(pool_id, accounts.bob);
+        let charlie_p = contract.get_pending_rewards(pool_id, accounts.charlie);
+        assert_eq!(bob_p + charlie_p, pool_share);
+        assert_eq!(bob_p, charlie_p);
+    }
+
+    #[ink::test]
+    fn test_claim_rewards_syncs_debt_and_clears_pending() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let pool_id = create_pool(&mut contract);
+
+        test::set_value_transferred::<DefaultEnvironment>(10_000_000_000_000u128);
+        contract.deposit_liquidity(pool_id).unwrap();
+        add_risk_assessment(&mut contract, 1);
+        let calc = contract
+            .calculate_premium(1, 500_000_000_000u128, CoverageType::Fire)
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(calc.annual_premium);
+        contract
+            .create_policy(
+                1,
+                CoverageType::Fire,
+                500_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+                "ipfs://m".into(),
+            )
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let pending_before = contract.get_pending_rewards(pool_id, accounts.alice);
+        assert!(pending_before > 0);
+        let claimed = contract.claim_rewards(pool_id).unwrap();
+        assert_eq!(claimed, pending_before);
+        assert_eq!(contract.get_pending_rewards(pool_id, accounts.alice), 0);
+        let p = contract
+            .get_liquidity_provider(pool_id, accounts.alice)
+            .unwrap();
+        let pool = contract.get_pool(pool_id).unwrap();
+        const PREC: u128 = 1_000_000_000_000_000_000;
+        assert_eq!(
+            p.reward_debt,
+            p.provider_stake
+                .saturating_mul(pool.accumulated_reward_per_share)
+                / PREC
+        );
+    }
+
+    #[ink::test]
+    fn test_reinvest_rewards_increases_stake_and_clears_pending() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let pool_id = create_pool(&mut contract);
+
+        test::set_value_transferred::<DefaultEnvironment>(10_000_000_000_000u128);
+        contract.deposit_liquidity(pool_id).unwrap();
+        let stake_before = contract
+            .get_liquidity_provider(pool_id, accounts.alice)
+            .unwrap()
+            .provider_stake;
+
+        add_risk_assessment(&mut contract, 1);
+        let calc = contract
+            .calculate_premium(1, 500_000_000_000u128, CoverageType::Fire)
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(calc.annual_premium);
+        contract
+            .create_policy(
+                1,
+                CoverageType::Fire,
+                500_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+                "ipfs://m".into(),
+            )
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let pending = contract.get_pending_rewards(pool_id, accounts.alice);
+        assert!(pending > 0);
+        contract.reinvest_rewards(pool_id).unwrap();
+        assert_eq!(contract.get_pending_rewards(pool_id, accounts.alice), 0);
+        let stake_after = contract
+            .get_liquidity_provider(pool_id, accounts.alice)
+            .unwrap()
+            .provider_stake;
+        assert_eq!(stake_after, stake_before.saturating_add(pending));
+
+        let pool = contract.get_pool(pool_id).unwrap();
+        assert_eq!(
+            pool.total_provider_stake,
+            stake_before.saturating_add(pending)
+        );
+    }
+
+    #[ink::test]
+    fn test_withdraw_liquidity_pays_principal_and_accrued_rewards() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let pool_id = create_pool(&mut contract);
+        let deposit = 10_000_000_000_000u128;
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(deposit);
+        contract.deposit_liquidity(pool_id).unwrap();
+
+        add_risk_assessment(&mut contract, 1);
+        let calc = contract
+            .calculate_premium(1, 500_000_000_000u128, CoverageType::Fire)
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        test::set_value_transferred::<DefaultEnvironment>(calc.annual_premium);
+        contract
+            .create_policy(
+                1,
+                CoverageType::Fire,
+                500_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+                "ipfs://m".into(),
+            )
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let rewards = contract.get_pending_rewards(pool_id, accounts.bob);
+        assert!(rewards > 0);
+        contract
+            .withdraw_liquidity(pool_id, deposit)
+            .expect("withdraw with auto reward payout");
+        assert!(contract
+            .get_liquidity_provider(pool_id, accounts.bob)
+            .is_none());
     }
 
     // =========================================================================
