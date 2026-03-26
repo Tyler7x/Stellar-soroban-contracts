@@ -72,6 +72,12 @@ mod propchain_oracle {
 
         /// AI valuation contract address
         ai_valuation_contract: Option<AccountId>,
+
+        /// Verified external events: event_id -> value
+        pub verified_events: Mapping<u64, u128>,
+
+        /// External event hashes: event_id -> payload_hash
+        pub event_hashes: Mapping<u64, ink::primitives::Hash>,
     }
 
     /// Events emitted by the oracle
@@ -124,6 +130,8 @@ mod propchain_oracle {
                 pending_requests: Mapping::default(),
                 request_id_counter: 0,
                 ai_valuation_contract: None,
+                verified_events: Mapping::default(),
+                event_hashes: Mapping::default(),
             }
         }
 
@@ -875,6 +883,29 @@ mod propchain_oracle {
         }
     }
 
+    /// Implementation of the ClaimOracle trait from propchain-traits
+    impl propchain_traits::ClaimOracle for PropertyValuationOracle {
+        #[ink(message)]
+        fn submit_external_event(
+            &mut self,
+            event_id: u64,
+            payload_hash: ink::primitives::Hash,
+        ) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            self.event_hashes.insert(&event_id, &payload_hash);
+            // Default verified value for MVP
+            self.verified_events.insert(&event_id, &100);
+            Ok(())
+        }
+
+        #[ink(message)]
+        fn get_verified_value(&self, event_id: u64) -> Result<u128, OracleError> {
+            self.verified_events
+                .get(&event_id)
+                .ok_or(OracleError::InvalidParameters)
+        }
+    }
+
     impl Default for PropertyValuationOracle {
         fn default() -> Self {
             Self::new(AccountId::from([0x0; 32]))
@@ -1278,5 +1309,23 @@ mod oracle_tests {
         assert!(oracle.pending_requests.get(&1).is_some());
         assert!(oracle.pending_requests.get(&2).is_some());
         assert!(oracle.pending_requests.get(&3).is_some());
+    }
+
+    #[ink::test]
+    fn test_claim_oracle_interface_works() {
+        use propchain_traits::ClaimOracle;
+        let mut oracle = setup_oracle();
+        let event_id = 101;
+        let payload_hash = ink::primitives::Hash::from([1u8; 32]);
+
+        // Submit event (admin only)
+        assert!(oracle.submit_external_event(event_id, payload_hash).is_ok());
+
+        // Verify value
+        let value = oracle.get_verified_value(event_id).unwrap();
+        assert_eq!(value, 100);
+
+        // Check hash
+        assert_eq!(oracle.event_hashes.get(&event_id).unwrap(), payload_hash);
     }
 }

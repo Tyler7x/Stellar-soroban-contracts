@@ -719,3 +719,23 @@ pub trait ComplianceChecker {
     #[ink(message)]
     fn is_compliant(&self, account: ink::primitives::AccountId) -> bool;
 }
+
+// =============================================================================
+// Claim Oracle Interface (Issue #145)
+// =============================================================================
+
+/// Trait for minimum-viable oracle interface for claim evaluation
+#[ink::trait_definition]
+pub trait ClaimOracle {
+    /// Submit an external event for verification
+    #[ink(message)]
+    fn submit_external_event(
+        &mut self,
+        event_id: u64,
+        payload_hash: ink::primitives::Hash,
+    ) -> Result<(), OracleError>;
+
+    /// Get verified value for an event
+    #[ink(message)]
+    fn get_verified_value(&self, event_id: u64) -> Result<u128, OracleError>;
+}
