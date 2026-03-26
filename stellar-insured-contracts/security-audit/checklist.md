@@ -17,6 +17,7 @@ Last updated: 2026-03-25
 | Integer overflows | Escrow deposit path rejects overflow; insurance premium calculation is exercised with maximum-value coverage inputs. | `contracts/escrow/src/tests.rs`, `contracts/insurance/src/lib.rs` security arithmetic regressions |
 | Access control | Admin-only emergency override and claim cooldown configuration are explicitly tested for unauthorized callers. | `contracts/escrow/src/tests.rs`, `contracts/insurance/src/lib.rs` security access-control regressions |
 | Time manipulation | Escrow timelock boundary and insurance claim cooldown boundary are explicitly tested. | `contracts/escrow/src/tests.rs`, `contracts/insurance/src/lib.rs` security time-boundary regressions |
+| Upgrade/admin controls | Proxy admin handoff and renounce flows must be two-step and timelocked, with explicit regression tests for early acceptance and unauthorized callers. | `contracts/proxy/src/lib.rs` admin transition tests |
 
 ## Contract Area Tracker
 
@@ -44,5 +45,9 @@ Last updated: 2026-03-25
 - [x] Integer-overflow regression coverage exists for security-sensitive arithmetic.
 - [x] Access-control regression coverage exists for privileged functions.
 - [x] Time-boundary regression coverage exists for timelocks and cooldowns.
+- [ ] Proxy and ownership control changes enforce a minimum on-chain delay of `n` days before finalization.
+- [ ] Production value for `n` is documented, governance-approved, and set to at least `7 days`.
+- [ ] Admin transfer uses `set_admin(new_admin)` then `accept_admin()`; no immediate single-call ownership takeover exists in production paths.
+- [ ] Admin renounce uses a schedule-then-execute flow and is tested for early execution rejection.
 - [ ] Property-token value-transfer paths have dedicated transfer-failure and re-entrancy review coverage.
 - [ ] Bridge/proxy upgrade paths have dedicated audit sign-off before production deployment.

@@ -193,12 +193,25 @@ cargo contract build --release --output-json > build-info.json
 # 1. Deploy new version
 cargo contract upload --new-version
 
-# 2. Migrate to new contract
-./scripts/migrate-contract.sh $OLD_ADDRESS $NEW_ADDRESS
+# 2. Schedule admin handoff or proxy-controlled upgrade window
+# set_admin(<new_admin>) or governance proposal queues the action
 
-# 3. Verify migration
+# 3. Wait for the on-chain timelock to fully elapse
+# minimum 3 days in staging, minimum 7 days in production
+
+# 4. Execute the handoff or approved upgrade
+# accept_admin() for ownership transfer, then run upgrade_to(...)
+
+# 5. Verify migration and emitted events
 ./scripts/verify-migration.sh $NEW_ADDRESS
 ```
+
+Timelock requirements:
+
+- All admin transfers must use a two-step flow: `set_admin(new_admin)` then `accept_admin()`.
+- All renounce operations must use a delayed schedule-then-execute flow.
+- Production deployments should enforce at least `n = 7 days` of on-chain delay before any control change becomes final.
+- Emergency procedures may pause user-facing actions, but they should not bypass the documented production timelock for ownership transfer.
 
 ## Troubleshooting
 
