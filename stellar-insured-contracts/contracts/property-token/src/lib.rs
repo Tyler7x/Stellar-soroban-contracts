@@ -2415,6 +2415,126 @@ mod property_token {
             assert!(compliance_info.verified);
         }
 
+        #[ink::test]
+        fn test_e2e_governance_execution_and_paused_bridge_failure_path() {
+            let mut contract = setup_contract();
+            let accounts = test::default_accounts::<DefaultEnvironment>();
+            test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+            let metadata = PropertyMetadata {
+                location: String::from("Governance House"),
+                size: 1800,
+                legal_description: String::from("Governance smoke flow"),
+                valuation: 900000,
+                documents_url: String::from("ipfs://governance-docs"),
+            };
+
+            let token_id = contract
+                .register_property_with_token(metadata)
+                .expect("Token registration should succeed");
+            assert!(contract.issue_shares(token_id, accounts.alice, 1_000).is_ok());
+            assert!(contract.transfer_shares(accounts.alice, accounts.bob, token_id, 400).is_ok());
+            assert_eq!(contract.share_balance_of(accounts.alice, token_id), 600);
+            assert_eq!(contract.share_balance_of(accounts.bob, token_id), 400);
+
+            let proposal_id = contract
+                .create_proposal(token_id, 700, Hash::from([9u8; 32]))
+                .expect("Owner should be able to create proposal");
+            let proposal_before_vote = contract
+                .proposals
+                .get((token_id, proposal_id))
+                .expect("proposal exists");
+            assert_eq!(proposal_before_vote.status, ProposalStatus::Open);
+            assert_eq!(proposal_before_vote.for_votes, 0);
+            assert_eq!(proposal_before_vote.against_votes, 0);
+
+            test::set_caller::<DefaultEnvironment>(accounts.bob);
+            assert!(contract.vote(token_id, proposal_id, true).is_ok());
+            let proposal_after_bob = contract
+                .proposals
+                .get((token_id, proposal_id))
+                .expect("proposal exists after first vote");
+            assert_eq!(proposal_after_bob.for_votes, 400);
+            assert_eq!(proposal_after_bob.against_votes, 0);
+
+            test::set_caller::<DefaultEnvironment>(accounts.alice);
+            assert!(contract.vote(token_id, proposal_id, true).is_ok());
+            let executed = contract
+                .execute_proposal(token_id, proposal_id)
+                .expect("proposal execution should succeed");
+            assert!(executed);
+
+            let proposal_after_execution = contract
+                .proposals
+                .get((token_id, proposal_id))
+                .expect("proposal exists after execution");
+            assert_eq!(proposal_after_execution.for_votes, 1_000);
+            assert_eq!(proposal_after_execution.against_votes, 0);
+            assert_eq!(proposal_after_execution.status, ProposalStatus::Executed);
+
+            let duplicate_vote = contract.vote(token_id, proposal_id, true);
+            assert_eq!(duplicate_vote, Err(Error::ProposalClosed));
+            let duplicate_execution = contract.execute_proposal(token_id, proposal_id);
+            assert_eq!(duplicate_execution, Err(Error::ProposalClosed));
+
+            assert!(contract.set_emergency_pause(true).is_ok());
+            let paused_bridge = contract.initiate_bridge_multisig(
+                token_id,
+                2,
+                accounts.charlie,
+                2,
+                None,
+            );
+            assert_eq!(paused_bridge, Err(Error::BridgePaused));
+
+            test::set_caller::<DefaultEnvironment>(accounts.bob);
+            let unauthorized_pause = contract.set_emergency_pause(false);
+            assert_eq!(unauthorized_pause, Err(Error::Unauthorized));
+        }
+
+        #[ink::test]
+        fn test_governance_rejects_proposal_without_quorum() {
+            let mut contract = setup_contract();
+            let accounts = test::default_accounts::<DefaultEnvironment>();
+            test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+            let metadata = PropertyMetadata {
+                location: String::from("Rejected Proposal House"),
+                size: 900,
+                legal_description: String::from("Proposal rejection path"),
+                valuation: 250000,
+                documents_url: String::from("ipfs://reject-docs"),
+            };
+
+            let token_id = contract
+                .register_property_with_token(metadata)
+                .expect("Token registration should succeed");
+            assert!(contract.issue_shares(token_id, accounts.alice, 1_000).is_ok());
+            assert!(contract.transfer_shares(accounts.alice, accounts.bob, token_id, 300).is_ok());
+
+            let proposal_id = contract
+                .create_proposal(token_id, 800, Hash::from([7u8; 32]))
+                .expect("Owner should be able to create proposal");
+
+            test::set_caller::<DefaultEnvironment>(accounts.bob);
+            assert!(contract.vote(token_id, proposal_id, false).is_ok());
+            test::set_caller::<DefaultEnvironment>(accounts.alice);
+            assert!(contract.vote(token_id, proposal_id, true).is_ok());
+
+            let passed = contract
+                .execute_proposal(token_id, proposal_id)
+                .expect("execution should settle the proposal");
+            assert!(!passed);
+
+            let rejected = contract
+                .proposals
+                .get((token_id, proposal_id))
+                .expect("proposal stored");
+            assert_eq!(rejected.for_votes, 700);
+            assert_eq!(rejected.against_votes, 300);
+            assert_eq!(rejected.status, ProposalStatus::Rejected);
+        }
+
         // ============================================================================
         // EDGE CASE TESTS
         // ============================================================================

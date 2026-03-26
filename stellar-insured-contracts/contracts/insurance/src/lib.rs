@@ -1911,6 +1911,12 @@ mod insurance_tests {
             .expect("pool creation failed")
     }
 
+    fn fee_split(amount: u128, fee_bps: u128) -> (u128, u128) {
+        let fee = amount.saturating_mul(fee_bps) / 10_000;
+        let pool_share = amount.saturating_sub(fee);
+        (fee, pool_share)
+    }
+
     // =========================================================================
     // CONSTRUCTOR
     // =========================================================================
@@ -2923,6 +2929,245 @@ mod insurance_tests {
         assert!(contract
             .get_liquidity_provider(pool_id, accounts.bob)
             .is_none());
+    }
+
+    #[ink::test]
+    fn test_e2e_policy_claim_payout_and_liquidity_withdrawal_smoke() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let pool_id = create_pool(&mut contract);
+        let deposit = 12_000_000_000_000u128;
+        let coverage = 500_000_000_000u128;
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        test::set_value_transferred::<DefaultEnvironment>(deposit);
+        contract.deposit_liquidity(pool_id).unwrap();
+
+        let pool_after_deposit = contract.get_pool(pool_id).unwrap();
+        assert_eq!(pool_after_deposit.total_capital, deposit);
+        assert_eq!(pool_after_deposit.available_capital, deposit);
+        assert_eq!(pool_after_deposit.total_provider_stake, deposit);
+        assert_eq!(pool_after_deposit.total_premiums_collected, 0);
+        assert_eq!(contract.get_pending_rewards(pool_id, accounts.alice), 0);
+
+        add_risk_assessment(&mut contract, 7);
+        let calc = contract
+            .calculate_premium(7, coverage, CoverageType::Fire)
+            .unwrap();
+        let premium_paid = calc.annual_premium;
+        let (_, pool_share) = fee_split(premium_paid, 200);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(premium_paid);
+        let policy_id = contract
+            .create_policy(
+                7,
+                CoverageType::Fire,
+                coverage,
+                pool_id,
+                86_400 * 365,
+                "ipfs://policy-7".into(),
+            )
+            .unwrap();
+
+        let policy_after_issue = contract.get_policy(policy_id).unwrap();
+        let token_after_issue = contract.get_token(1).unwrap();
+        let pool_after_issue = contract.get_pool(pool_id).unwrap();
+        assert_eq!(policy_after_issue.status, PolicyStatus::Active);
+        assert_eq!(policy_after_issue.policyholder, accounts.bob);
+        assert_eq!(policy_after_issue.premium_amount, premium_paid);
+        assert_eq!(token_after_issue.policy_id, policy_id);
+        assert_eq!(token_after_issue.owner, accounts.bob);
+        assert_eq!(pool_after_issue.active_policies, 1);
+        assert_eq!(pool_after_issue.total_premiums_collected, pool_share);
+        assert_eq!(pool_after_issue.available_capital, deposit + pool_share);
+        assert_eq!(contract.get_pending_rewards(pool_id, accounts.alice), pool_share);
+
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        let unauthorized_pre_transfer = contract.submit_claim(
+            policy_id,
+            calc.deductible.saturating_add(50_000_000_000u128),
+            "Should fail before token transfer".into(),
+            valid_evidence(),
+        );
+        assert_eq!(unauthorized_pre_transfer, Err(InsuranceError::Unauthorized));
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        contract.list_token_for_sale(1, 250_000_000u128).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        test::set_value_transferred::<DefaultEnvironment>(250_000_000u128);
+        contract.purchase_token(1).unwrap();
+
+        let policy_after_transfer = contract.get_policy(policy_id).unwrap();
+        let token_after_transfer = contract.get_token(1).unwrap();
+        assert_eq!(policy_after_transfer.policyholder, accounts.charlie);
+        assert_eq!(token_after_transfer.owner, accounts.charlie);
+        assert!(!contract
+            .get_policyholder_policies(accounts.bob)
+            .contains(&policy_id));
+        assert!(contract
+            .get_policyholder_policies(accounts.charlie)
+            .contains(&policy_id));
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let old_holder_submit = contract.submit_claim(
+            policy_id,
+            calc.deductible.saturating_add(50_000_000_000u128),
+            "Former holder".into(),
+            valid_evidence(),
+        );
+        assert_eq!(old_holder_submit, Err(InsuranceError::Unauthorized));
+
+        let claim_amount = calc.deductible.saturating_add(120_000_000_000u128);
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        let claim_id = contract
+            .submit_claim(
+                policy_id,
+                claim_amount,
+                "Fire spread through the upper floor".into(),
+                valid_evidence(),
+            )
+            .unwrap();
+
+        let claim_after_submit = contract.get_claim(claim_id).unwrap();
+        assert_eq!(claim_after_submit.status, ClaimStatus::Pending);
+        assert_eq!(claim_after_submit.claimant, accounts.charlie);
+        assert_eq!(claim_after_submit.claim_amount, claim_amount);
+        assert_eq!(contract.get_policy_claims(policy_id), vec![claim_id]);
+
+        test::set_caller::<DefaultEnvironment>(accounts.django);
+        let unauthorized_review =
+            contract.process_claim(claim_id, true, "ipfs://oracle-ok".into(), String::new());
+        assert_eq!(unauthorized_review, Err(InsuranceError::Unauthorized));
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract.authorize_assessor(accounts.eve).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.eve);
+        contract
+            .process_claim(claim_id, true, "ipfs://oracle-ok".into(), String::new())
+            .unwrap();
+
+        let claim_after_approval = contract.get_claim(claim_id).unwrap();
+        let policy_after_payout = contract.get_policy(policy_id).unwrap();
+        let pool_after_payout = contract.get_pool(pool_id).unwrap();
+        let payout = claim_amount.saturating_sub(calc.deductible);
+        assert_eq!(claim_after_approval.status, ClaimStatus::Paid);
+        assert_eq!(claim_after_approval.assessor, Some(accounts.eve));
+        assert_eq!(claim_after_approval.payout_amount, payout);
+        assert_eq!(policy_after_payout.total_claimed, payout);
+        assert_eq!(policy_after_payout.status, PolicyStatus::Active);
+        assert_eq!(pool_after_payout.total_claims_paid, payout);
+        assert_eq!(
+            pool_after_payout.available_capital,
+            deposit + pool_share - payout
+        );
+        assert_eq!(contract.get_pending_rewards(pool_id, accounts.alice), pool_share);
+
+        let max_withdrawable_principal = pool_after_payout
+            .available_capital
+            .saturating_sub(contract.get_pending_rewards(pool_id, accounts.alice));
+        assert_eq!(max_withdrawable_principal, deposit.saturating_sub(payout));
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract
+            .withdraw_liquidity(pool_id, max_withdrawable_principal)
+            .unwrap();
+
+        let pool_after_withdraw = contract.get_pool(pool_id).unwrap();
+        let provider_after_withdraw = contract
+            .get_liquidity_provider(pool_id, accounts.alice)
+            .unwrap();
+        assert_eq!(provider_after_withdraw.provider_stake, payout);
+        assert_eq!(contract.get_pending_rewards(pool_id, accounts.alice), 0);
+        assert_eq!(pool_after_withdraw.total_provider_stake, payout);
+        assert_eq!(pool_after_withdraw.total_capital, payout);
+        assert_eq!(pool_after_withdraw.available_capital, 0);
+        assert_eq!(pool_after_withdraw.total_claims_paid, payout);
+        assert_eq!(pool_after_withdraw.total_premiums_collected, pool_share);
+    }
+
+    #[ink::test]
+    fn test_e2e_failure_paths_for_claim_rejection_expiry_and_coverage_limits() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let pool_id = create_pool(&mut contract);
+        let deposit = 10_000_000_000_000u128;
+        let coverage = 300_000_000_000u128;
+
+        test::set_value_transferred::<DefaultEnvironment>(deposit);
+        contract.deposit_liquidity(pool_id).unwrap();
+        add_risk_assessment(&mut contract, 11);
+
+        let calc = contract
+            .calculate_premium(11, coverage, CoverageType::Fire)
+            .unwrap();
+        let premium_paid = calc.annual_premium;
+        let (_, pool_share) = fee_split(premium_paid, 200);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(premium_paid);
+        let policy_id = contract
+            .create_policy(
+                11,
+                CoverageType::Fire,
+                coverage,
+                pool_id,
+                1_000,
+                "ipfs://policy-11".into(),
+            )
+            .unwrap();
+
+        let excessive_claim = contract.submit_claim(
+            policy_id,
+            coverage.saturating_add(1),
+            "Coverage overflow".into(),
+            valid_evidence(),
+        );
+        assert_eq!(excessive_claim, Err(InsuranceError::ClaimExceedsCoverage));
+
+        let claim_amount = calc.deductible.saturating_add(25_000_000_000u128);
+        let claim_id = contract
+            .submit_claim(
+                policy_id,
+                claim_amount,
+                "Minor fire claim".into(),
+                valid_evidence(),
+            )
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract
+            .process_claim(
+                claim_id,
+                false,
+                "ipfs://oracle-reject".into(),
+                "Evidence inconsistent".into(),
+            )
+            .unwrap();
+
+        let rejected_claim = contract.get_claim(claim_id).unwrap();
+        let policy_after_rejection = contract.get_policy(policy_id).unwrap();
+        let pool_after_rejection = contract.get_pool(pool_id).unwrap();
+        assert_eq!(rejected_claim.status, ClaimStatus::Rejected);
+        assert_eq!(rejected_claim.rejection_reason, "Evidence inconsistent");
+        assert_eq!(policy_after_rejection.total_claimed, 0);
+        assert_eq!(policy_after_rejection.status, PolicyStatus::Active);
+        assert_eq!(pool_after_rejection.total_claims_paid, 0);
+        assert_eq!(pool_after_rejection.available_capital, deposit + pool_share);
+
+        test::set_block_timestamp::<DefaultEnvironment>(policy_after_rejection.end_time + 1);
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let expired_claim = contract.submit_claim(
+            policy_id,
+            claim_amount,
+            "Too late".into(),
+            valid_evidence(),
+        );
+        assert_eq!(expired_claim, Err(InsuranceError::PolicyExpired));
+
+        let second_review_attempt =
+            contract.process_claim(claim_id, true, "ipfs://oracle-late".into(), String::new());
+        assert_eq!(second_review_attempt, Err(InsuranceError::ClaimAlreadyProcessed));
     }
 
     // =========================================================================
