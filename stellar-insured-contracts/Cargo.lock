@@ -5022,6 +5022,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "propchain-governance"
+version = "1.0.0"
+dependencies = [
+ "ink 5.1.1",
+ "ink_e2e",
+ "parity-scale-codec",
+ "propchain-traits",
+ "scale-info",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "propchain-insurance"
 version = "1.0.0"
 dependencies = [
