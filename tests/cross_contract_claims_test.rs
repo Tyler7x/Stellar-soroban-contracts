@@ -79,6 +79,45 @@ fn test_emergency_pause_prevents_claims() {
 }
 
 #[test]
+fn test_risk_pool_vesting_rewards() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (pol_addr, admin, _guardian, _pol, _clm, pool) = setup(&env);
+
+    let provider = Address::generate(&env);
+    pool.deposit(&provider, &1_000_000i128).unwrap();
+    assert_eq!(pool.get_balance(), 1_000_000i128);
+
+    pool.set_vesting_parameters(&admin, &100, &1000, &500).unwrap();
+    pool.allocate_rewards(&admin, &provider, &100i128).unwrap();
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 50);
+    assert_eq!(pool.get_provider_vested_rewards(&provider), 0);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 150); // now 200
+    let vested = pool.get_provider_vested_rewards(&provider);
+    assert_eq!(vested, 20);
+
+    let claimed_early = pool.claim_vested_rewards(&provider).unwrap();
+    assert_eq!(claimed_early, 19);
+
+    let stats = pool.get_vesting_statistics();
+    assert_eq!(stats.total_claimed_rewards, 19);
+    assert_eq!(stats.total_penalty_collected, 1);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1000); // now 1200
+    let vested_remaining = pool.get_provider_vested_rewards(&provider);
+    assert_eq!(vested_remaining, 80);
+
+    let claimed_later = pool.claim_vested_rewards(&provider).unwrap();
+    assert_eq!(claimed_later, 80);
+
+    let stats_final = pool.get_vesting_statistics();
+    assert_eq!(stats_final.total_claimed_rewards, 99);
+    assert_eq!(stats_final.total_penalty_collected, 1);
+}
+
+#[test]
 fn test_claim_evidence_management() {
     let env = Env::default();
     env.mock_all_auths();
