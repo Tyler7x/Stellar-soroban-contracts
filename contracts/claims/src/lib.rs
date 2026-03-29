@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Vec};
 
 mod policy_client {
     use soroban_sdk::{contractclient, Env};
@@ -14,6 +14,34 @@ use policy_client::PolicyClient;
 #[contracttype]
 #[derive(Clone, PartialEq)]
 pub enum ClaimStatus { Pending, Approved, Rejected, Settled }
+
+/// Status of an automatic payout for an approved claim.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PayoutStatus {
+    /// Payout record created, transfer not yet attempted.
+    Pending,
+    /// Transfer executed successfully.
+    Completed,
+    /// Transfer failed; may be retried.
+    Failed,
+}
+
+/// Tracks the lifecycle of a single claim payout.
+#[contracttype]
+#[derive(Clone)]
+pub struct PayoutRecord {
+    pub claim_id: u64,
+    pub recipient: Address,
+    pub amount: i128,
+    pub status: PayoutStatus,
+    pub initiated_at: u64,
+    pub completed_at: Option<u64>,
+    /// Number of times a retry has been attempted after an initial failure.
+    pub retry_count: u32,
+    /// Short symbol describing the reason for the last failure, if any.
+    pub failure_reason: Option<Symbol>,
+}
 
 #[contracttype]
 #[derive(Clone)]
@@ -57,13 +85,16 @@ pub struct EvidenceItem {
 
 const CLAIMS: Symbol = symbol_short!("CLAIMS");
 const EVIDENCE: Symbol = symbol_short!("EVIDENCE");
-const EVIDENCE_BY_CLAIM: Symbol = symbol_short!("EVIDENCE_BY_CLAIM");
-const EVIDENCE_SEQ: Symbol = symbol_short!("EVIDENCE_SEQ");
+const EVIDENCE_BY_CLAIM: Symbol = symbol_short!("EV_BYCLM");
+const EVIDENCE_SEQ: Symbol = symbol_short!("EV_SEQ");
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const GUARDIAN: Symbol = symbol_short!("GUARDIAN");
 const PAUSE_STATE: Symbol = symbol_short!("PAUSED");
 const FRAUD_INFO: Symbol = symbol_short!("FRAUD");
 const CLAIM_HISTORY: Symbol = symbol_short!("HISTORY");
+const TOKEN: Symbol = symbol_short!("TOKEN");
+const PAYOUT: Symbol = symbol_short!("PAYOUT");
+const MAX_RETRIES: Symbol = symbol_short!("MAX_RETRY");
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,6 +117,12 @@ pub enum ClaimsEvent {
     ContractUnpaused(Address, Option<Symbol>),
     FraudFlagged(u64, u32),
     FraudConfirmed(u64),
+    /// Fired when the contract begins processing a payout for an approved claim.
+    PayoutInitiated(u64, Address, i128),  // claim_id, recipient, amount
+    /// Fired when a token transfer completes successfully.
+    PayoutCompleted(u64, Address, i128),  // claim_id, recipient, amount
+    /// Fired when a payout attempt fails. Contains current retry_count.
+    PayoutFailed(u64, u32),              // claim_id, retry_count
 }
 
 #[derive(soroban_sdk::contracterror, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -102,6 +139,16 @@ pub enum ClaimError {
     ContractPaused = 9,
     Unauthorized = 10,
     ClaimFlaggedAsFraud = 11,
+    /// Token transfer to the recipient failed (e.g. insufficient contract balance).
+    PayoutFailed = 12,
+    /// The claim's payout has already been completed and cannot be retried.
+    PayoutAlreadyProcessed = 13,
+    /// Maximum retry attempts for a failed payout have been exhausted.
+    MaxRetriesExceeded = 14,
+    /// The recipient address is invalid (e.g. resolves to the contract itself).
+    InvalidRecipient = 15,
+    /// No payout token address has been configured via set_payout_token.
+    TokenNotConfigured = 16,
 }
 
 #[contract]
@@ -114,6 +161,24 @@ impl ClaimsContract {
         env.storage().instance().set(&ADMIN, &admin);
         env.storage().instance().set(&GUARDIAN, &guardian);
         env.storage().instance().set(&PAUSE_STATE, &PauseState { is_paused: false, paused_at: None, paused_by: None, reason: None });
+    }
+
+    /// Set the SEP-41 token contract address used for automatic payouts.
+    /// Only the admin or guardian may call this.
+    pub fn set_payout_token(env: Env, caller: Address, token_address: Address) -> Result<(), ClaimError> {
+        caller.require_auth();
+        if !Self::is_admin_or_guardian(&env, &caller) { return Err(ClaimError::Unauthorized); }
+        env.storage().instance().set(&TOKEN, &token_address);
+        Ok(())
+    }
+
+    /// Override the maximum number of payout retry attempts (default: 3).
+    /// Only the admin or guardian may call this.
+    pub fn set_max_retries(env: Env, caller: Address, max: u32) -> Result<(), ClaimError> {
+        caller.require_auth();
+        if !Self::is_admin_or_guardian(&env, &caller) { return Err(ClaimError::Unauthorized); }
+        env.storage().instance().set(&MAX_RETRIES, &max);
+        Ok(())
     }
 
     pub fn set_pause_state(env: Env, caller: Address, is_paused: bool, reason: Option<Symbol>) -> Result<(), ClaimError> {
@@ -258,17 +323,17 @@ impl ClaimsContract {
 
     pub fn get_claim_evidence_ids(env: Env, claim_id: u64) -> Result<Vec<u64>, ClaimError> {
         let claim = Self::load_claim_record(&env, claim_id)?;
-        let mut ids: Vec<u64> = Vec::new();
+        let mut ids: Vec<u64> = Vec::new(&env);
         for idx in 0..claim.evidence_count {
             let evidence_id: u64 = env.storage().persistent().get(&(EVIDENCE_BY_CLAIM, claim_id, idx)).unwrap();
-            ids.push(evidence_id);
+            ids.push_back(evidence_id);
         }
         Ok(ids)
     }
 
     pub fn get_claim_evidence(env: Env, caller: Address, claim_id: u64) -> Result<Vec<EvidenceItem>, ClaimError> {
         let claim = Self::load_claim_record(&env, claim_id)?;
-        let mut items: Vec<EvidenceItem> = Vec::new();
+        let mut items: Vec<EvidenceItem> = Vec::new(&env);
 
         for idx in 0..claim.evidence_count {
             let evidence_id: u64 = env.storage().persistent().get(&(EVIDENCE_BY_CLAIM, claim_id, idx)).unwrap();
@@ -276,7 +341,7 @@ impl ClaimsContract {
             if evidence.sensitive && !Self::is_claim_access_allowed(&env, &caller, &claim) {
                 continue;
             }
-            items.push(evidence);
+            items.push_back(evidence);
         }
 
         Ok(items)
@@ -322,7 +387,264 @@ impl ClaimsContract {
         r.status = ClaimStatus::Approved;
         env.storage().persistent().set(&key, &r);
         env.events().publish((CLAIMS, Symbol::short("APPROVE")), ClaimsEvent::ClaimApproved(claim_id));
+
+        // Automatically initiate the payout. Any failure is captured in the
+        // PayoutRecord so approval is never rolled back due to payout issues.
+        let recipient = r.claimant.clone();
+        let amount = r.amount;
+        let _ = Self::initiate_payout_internal(&env, claim_id, recipient, amount);
+
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Payout helpers
+    // -----------------------------------------------------------------------
+
+    /// Core payout logic shared by `approve_claim` and `retry_payout`.
+    ///
+    /// On success the claim is automatically moved to `Settled`.
+    /// On failure the `PayoutRecord` is persisted with `PayoutStatus::Failed`
+    /// and a descriptive `failure_reason` symbol so callers can retry.
+    fn initiate_payout_internal(
+        env: &Env,
+        claim_id: u64,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), ClaimError> {
+        let now = env.ledger().timestamp();
+
+        // --- Validate recipient ---
+        if recipient == env.current_contract_address() {
+            let payout = PayoutRecord {
+                claim_id,
+                recipient,
+                amount,
+                status: PayoutStatus::Failed,
+                initiated_at: now,
+                completed_at: None,
+                retry_count: 0,
+                failure_reason: Some(symbol_short!("INV_RCPT")),
+            };
+            env.storage().persistent().set(&(PAYOUT, claim_id), &payout);
+            env.events().publish(
+                (PAYOUT, symbol_short!("FAIL")),
+                ClaimsEvent::PayoutFailed(claim_id, 0),
+            );
+            return Err(ClaimError::InvalidRecipient);
+        }
+
+        if amount <= 0 {
+            let payout = PayoutRecord {
+                claim_id,
+                recipient,
+                amount,
+                status: PayoutStatus::Failed,
+                initiated_at: now,
+                completed_at: None,
+                retry_count: 0,
+                failure_reason: Some(symbol_short!("INV_AMT")),
+            };
+            env.storage().persistent().set(&(PAYOUT, claim_id), &payout);
+            env.events().publish(
+                (PAYOUT, symbol_short!("FAIL")),
+                ClaimsEvent::PayoutFailed(claim_id, 0),
+            );
+            return Err(ClaimError::InvalidParameters);
+        }
+
+        // Emit initiation event before attempting transfer
+        env.events().publish(
+            (PAYOUT, symbol_short!("INIT")),
+            ClaimsEvent::PayoutInitiated(claim_id, recipient.clone(), amount),
+        );
+
+        // --- Resolve token contract ---
+        let token_address: Option<Address> = env.storage().instance().get(&TOKEN);
+        if token_address.is_none() {
+            let payout = PayoutRecord {
+                claim_id,
+                recipient,
+                amount,
+                status: PayoutStatus::Failed,
+                initiated_at: now,
+                completed_at: None,
+                retry_count: 0,
+                failure_reason: Some(symbol_short!("NO_TOKEN")),
+            };
+            env.storage().persistent().set(&(PAYOUT, claim_id), &payout);
+            env.events().publish(
+                (PAYOUT, symbol_short!("FAIL")),
+                ClaimsEvent::PayoutFailed(claim_id, 0),
+            );
+            return Err(ClaimError::TokenNotConfigured);
+        }
+
+        let token_addr = token_address.unwrap();
+        let token_client = token::Client::new(env, &token_addr);
+
+        // --- Pre-flight balance check (graceful failure) ---
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        if contract_balance < amount {
+            let payout = PayoutRecord {
+                claim_id,
+                recipient,
+                amount,
+                status: PayoutStatus::Failed,
+                initiated_at: now,
+                completed_at: None,
+                retry_count: 0,
+                failure_reason: Some(symbol_short!("LOW_BAL")),
+            };
+            env.storage().persistent().set(&(PAYOUT, claim_id), &payout);
+            env.events().publish(
+                (PAYOUT, symbol_short!("FAIL")),
+                ClaimsEvent::PayoutFailed(claim_id, 0),
+            );
+            return Err(ClaimError::PayoutFailed);
+        }
+
+        // --- Execute transfer ---
+        token_client.transfer(&env.current_contract_address(), &recipient, &amount);
+
+        // --- Mark payout completed ---
+        let payout = PayoutRecord {
+            claim_id,
+            recipient: recipient.clone(),
+            amount,
+            status: PayoutStatus::Completed,
+            initiated_at: now,
+            completed_at: Some(now),
+            retry_count: 0,
+            failure_reason: None,
+        };
+        env.storage().persistent().set(&(PAYOUT, claim_id), &payout);
+
+        // Auto-settle the claim so callers observe the correct state
+        let claim_key = (CLAIMS, claim_id);
+        let mut claim: ClaimRecord = env.storage().persistent().get(&claim_key).unwrap();
+        claim.status = ClaimStatus::Settled;
+        env.storage().persistent().set(&claim_key, &claim);
+        env.events().publish(
+            (CLAIMS, Symbol::short("SETTLE")),
+            ClaimsEvent::ClaimSettled(claim_id),
+        );
+
+        env.events().publish(
+            (PAYOUT, symbol_short!("DONE")),
+            ClaimsEvent::PayoutCompleted(claim_id, recipient, amount),
+        );
+
+        Ok(())
+    }
+
+    /// Retry a previously failed payout. Only callable when `PayoutStatus` is
+    /// `Failed` and the retry count is below the configured maximum (default 3).
+    pub fn retry_payout(env: Env, claim_id: u64) -> Result<(), ClaimError> {
+        if Self::is_paused(env.clone()) { return Err(ClaimError::ContractPaused); }
+
+        let payout_key = (PAYOUT, claim_id);
+        let mut payout: PayoutRecord = env.storage()
+            .persistent()
+            .get(&payout_key)
+            .ok_or(ClaimError::ClaimNotFound)?;
+
+        if payout.status == PayoutStatus::Completed {
+            return Err(ClaimError::PayoutAlreadyProcessed);
+        }
+        if payout.status != PayoutStatus::Failed {
+            return Err(ClaimError::PayoutFailed);
+        }
+
+        let max_retries: u32 = env.storage().instance().get(&MAX_RETRIES).unwrap_or(3);
+        if payout.retry_count >= max_retries {
+            return Err(ClaimError::MaxRetriesExceeded);
+        }
+
+        // Validate recipient has not somehow become the contract address
+        if payout.recipient == env.current_contract_address() {
+            return Err(ClaimError::InvalidRecipient);
+        }
+
+        payout.retry_count += 1;
+        payout.failure_reason = None;
+        let now = env.ledger().timestamp();
+
+        // Emit initiation event for this retry attempt
+        env.events().publish(
+            (PAYOUT, symbol_short!("INIT")),
+            ClaimsEvent::PayoutInitiated(claim_id, payout.recipient.clone(), payout.amount),
+        );
+
+        // Resolve token
+        let token_address: Option<Address> = env.storage().instance().get(&TOKEN);
+        if token_address.is_none() {
+            payout.status = PayoutStatus::Failed;
+            payout.failure_reason = Some(symbol_short!("NO_TOKEN"));
+            env.storage().persistent().set(&payout_key, &payout);
+            env.events().publish(
+                (PAYOUT, symbol_short!("FAIL")),
+                ClaimsEvent::PayoutFailed(claim_id, payout.retry_count),
+            );
+            return Err(ClaimError::TokenNotConfigured);
+        }
+
+        let token_addr = token_address.unwrap();
+        let token_client = token::Client::new(&env, &token_addr);
+
+        // Pre-flight balance check
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        if contract_balance < payout.amount {
+            payout.status = PayoutStatus::Failed;
+            payout.failure_reason = Some(symbol_short!("LOW_BAL"));
+            env.storage().persistent().set(&payout_key, &payout);
+            env.events().publish(
+                (PAYOUT, symbol_short!("FAIL")),
+                ClaimsEvent::PayoutFailed(claim_id, payout.retry_count),
+            );
+            return Err(ClaimError::PayoutFailed);
+        }
+
+        // Execute transfer
+        token_client.transfer(&env.current_contract_address(), &payout.recipient, &payout.amount);
+
+        payout.status = PayoutStatus::Completed;
+        payout.completed_at = Some(now);
+        env.storage().persistent().set(&payout_key, &payout);
+
+        // Auto-settle
+        let claim_key = (CLAIMS, claim_id);
+        let mut claim: ClaimRecord = env.storage().persistent().get(&claim_key).unwrap();
+        claim.status = ClaimStatus::Settled;
+        env.storage().persistent().set(&claim_key, &claim);
+        env.events().publish(
+            (CLAIMS, Symbol::short("SETTLE")),
+            ClaimsEvent::ClaimSettled(claim_id),
+        );
+
+        env.events().publish(
+            (PAYOUT, symbol_short!("DONE")),
+            ClaimsEvent::PayoutCompleted(claim_id, payout.recipient.clone(), payout.amount),
+        );
+
+        Ok(())
+    }
+
+    /// Return the full `PayoutRecord` for a given claim.
+    pub fn get_payout(env: Env, claim_id: u64) -> Result<PayoutRecord, ClaimError> {
+        env.storage()
+            .persistent()
+            .get(&(PAYOUT, claim_id))
+            .ok_or(ClaimError::ClaimNotFound)
+    }
+
+    /// Return only the `PayoutStatus` for a given claim (cheaper read).
+    pub fn get_payout_status(env: Env, claim_id: u64) -> Result<PayoutStatus, ClaimError> {
+        let payout: PayoutRecord = env.storage()
+            .persistent()
+            .get(&(PAYOUT, claim_id))
+            .ok_or(ClaimError::ClaimNotFound)?;
+        Ok(payout.status)
     }
 
     pub fn settle_claim(env: Env, claim_id: u64) -> Result<(), ClaimError> {
