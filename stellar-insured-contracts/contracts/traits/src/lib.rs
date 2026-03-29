@@ -721,6 +721,80 @@ pub trait ComplianceChecker {
 }
 
 // =============================================================================
+// Cross-Chain Insurance Bridge (Issue #198)
+// =============================================================================
+
+pub trait InsuranceBridge {
+    type Error;
+    fn bridge_policy(&mut self, policy_id: u64, dest_chain: ChainId) -> Result<(), Self::Error>;
+    fn receive_bridged_policy(&mut self, source_chain: ChainId, policy_data: Vec<u8>) -> Result<u64, Self::Error>;
+    fn bridge_claim(&mut self, claim_id: u64, dest_chain: ChainId) -> Result<(), Self::Error>;
+    fn receive_bridged_claim(&mut self, source_chain: ChainId, claim_data: Vec<u8>) -> Result<u64, Self::Error>;
+    fn bridge_governance_decision(&mut self, proposal_id: u64, dest_chain: ChainId) -> Result<(), Self::Error>;
+    fn verify_relayer(&self, relayer: ink::primitives::AccountId) -> bool;
+}
+
+// =============================================================================
+// Gas Abstraction Layer (Issue #199)
+// =============================================================================
+
+#[derive(Debug, Clone, PartialEq, scale::Encode, scale::Decode)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct MetaTransaction {
+    pub nonce: u64,
+    pub from: ink::primitives::AccountId,
+    pub function_signature: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub fee_token: Option<ink::primitives::AccountId>,
+    pub fee_amount: u128,
+}
+
+pub trait GasAbstraction {
+    type Error;
+    fn execute_meta_transaction(&mut self, tx: MetaTransaction) -> Result<(), Self::Error>;
+    fn sponsor_user_gas(&mut self, user: ink::primitives::AccountId, amount: u128) -> Result<(), Self::Error>;
+    fn convert_stablecoin_to_gas(&mut self, amount: u128) -> Result<u128, Self::Error>;
+    fn track_gas_reimbursement(&self, user: ink::primitives::AccountId) -> u128;
+    fn is_gas_subsidized(&self, operation: Vec<u8>) -> bool;
+}
+
+// =============================================================================
+// Compliance Oracle Integration (Issue #200)
+// =============================================================================
+
+pub trait ComplianceOracleInterface {
+    type Error;
+    fn fetch_kyc_status(&self, user: ink::primitives::AccountId) -> Result<bool, Self::Error>;
+    fn fetch_sanctions_status(&self, user: ink::primitives::AccountId) -> Result<bool, Self::Error>;
+    fn verify_zk_compliance_proof(&self, user: ink::primitives::AccountId, proof: Vec<u8>) -> Result<bool, Self::Error>;
+}
+
+// =============================================================================
+// Catastrophe Bond Mechanism (Issue #201)
+// =============================================================================
+
+#[derive(Debug, Clone, PartialEq, scale::Encode, scale::Decode)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct CatBondToken {
+    pub bond_id: u64,
+    pub principal: u128,
+    pub coupon_rate: u32,
+    pub maturity_date: u64,
+    pub trigger_oracle: ink::primitives::AccountId,
+    pub trigger_threshold: u128,
+    pub is_triggered: bool,
+}
+
+pub trait CatastropheBond {
+    type Error;
+    fn issue_bond(&mut self, principal: u128, coupon_rate: u32, maturity_date: u64, trigger_oracle: ink::primitives::AccountId, trigger_threshold: u128) -> Result<u64, Self::Error>;
+    fn trade_bond(&mut self, bond_id: u64, to: ink::primitives::AccountId, amount: u128) -> Result<(), Self::Error>;
+    fn check_trigger_condition(&mut self, bond_id: u64) -> Result<bool, Self::Error>;
+    fn automate_payout(&mut self, bond_id: u64) -> Result<(), Self::Error>;
+    fn model_bond_pricing(&self, risk_score: u32, principal: u128) -> u128;
+}
+
+// =============================================================================
 // Claim Oracle Interface (Issue #145)
 // =============================================================================
 

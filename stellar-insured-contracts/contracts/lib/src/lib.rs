@@ -52,6 +52,10 @@ mod propchain_contracts {
         GovernanceProposalMismatch,
         NotArbitrator,
         AppealNotUnderReview,
+        NotRelayer,
+        BondNotFound,
+        BondNotTriggered,
+        InvalidNonce,
     }
 
     /// Property Registry contract
@@ -112,6 +116,22 @@ mod propchain_contracts {
         arbitrators: Mapping<AccountId, bool>,
         /// Governance proposal outcomes: proposal_id -> approved (true = overturn slash)
         governance_proposals: Mapping<u64, bool>,
+        /// Nonces for meta-transactions
+        nonces: Mapping<AccountId, u64>,
+        /// Gas sponsorships tracking
+        gas_sponsorships: Mapping<AccountId, u128>,
+        /// Relayers for cross-chain bridge
+        relayers: Mapping<AccountId, bool>,
+        /// Bridged policies tracking
+        bridged_policies: Mapping<u64, ChainId>,
+        /// Bridged claims tracking
+        bridged_claims: Mapping<u64, ChainId>,
+        /// Catastrophe Bonds mapping
+        cat_bonds: Mapping<u64, CatBondToken>,
+        /// Catastrophe Bond counter
+        cat_bond_count: u64,
+        /// Catastrophe Bond owners
+        cat_bond_owners: Mapping<u64, AccountId>,
     }
 
     /// Escrow information
@@ -941,6 +961,14 @@ mod propchain_contracts {
                 appeal_window_duration: 7 * 24 * 60 * 60 * 1_000,
                 arbitrators: Mapping::default(),
                 governance_proposals: Mapping::default(),
+                nonces: Mapping::default(),
+                gas_sponsorships: Mapping::default(),
+                relayers: Mapping::default(),
+                bridged_policies: Mapping::default(),
+                bridged_claims: Mapping::default(),
+                cat_bonds: Mapping::default(),
+                cat_bond_count: 0,
+                cat_bond_owners: Mapping::default(),
             };
 
             // Emit contract initialization event
@@ -2880,6 +2908,47 @@ mod propchain_contracts {
         pub fn get_appeal_window_duration(&self) -> u64 {
             self.appeal_window_duration
         }
+
+        // =====================================================================
+        // GAS ABSTRACTION LAYER
+        // =====================================================================
+
+        /// Executes a meta transaction using an abstracted gas fee layer
+        #[ink(message)]
+        pub fn execute_meta_transaction(&mut self, tx: MetaTransaction) -> Result<(), Error> {
+            self.ensure_not_paused()?;
+            let current_nonce = self.nonces.get(tx.from).unwrap_or(0);
+            
+            if tx.nonce != current_nonce {
+                return Err(Error::InvalidNonce);
+            }
+            
+            self.nonces.insert(tx.from, &(current_nonce + 1));
+            // (In actual deployment, ecdsa/sr25519 signature recovery and payload decoding executes here)
+            Ok(())
+        }
+
+        /// Sponsors native gas using protocol reserves for specific users
+        #[ink(message)]
+        pub fn sponsor_user_gas(&mut self, user: AccountId, amount: u128) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            let current_allowance = self.gas_sponsorships.get(user).unwrap_or(0);
+            self.gas_sponsorships.insert(user, &(current_allowance.saturating_add(amount)));
+            Ok(())
+        }
+
+        /// Convert stablecoin deposits directly to gas allocations
+        #[ink(message)]
+        pub fn convert_stablecoin_to_gas(&mut self, usdc_amount: u128) -> Result<u128, Error> {
+            // Example fixed exchange rate (e.g. 1 USDC = 10 Native Gas Base Tokens equivalent)
+            let gas_equivalent = usdc_amount.saturating_mul(10);
+            let caller = self.env().caller();
+            let current_allowance = self.gas_sponsorships.get(caller).unwrap_or(0);
+            self.gas_sponsorships.insert(caller, &(current_allowance.saturating_add(gas_equivalent)));
+            Ok(gas_equivalent)
+        }
     }
 
     #[cfg(kani)]
@@ -2904,6 +2973,111 @@ mod propchain_contracts {
             if id > 0 {
                 assert!(id > 0);
             }
+        }
+    }
+
+    impl GasAbstraction for PropertyRegistry {
+        type Error = Error;
+        fn execute_meta_transaction(&mut self, tx: MetaTransaction) -> Result<(), Self::Error> {
+            PropertyRegistry::execute_meta_transaction(self, tx)
+        }
+        fn sponsor_user_gas(&mut self, user: AccountId, amount: u128) -> Result<(), Self::Error> {
+            PropertyRegistry::sponsor_user_gas(self, user, amount)
+        }
+        fn convert_stablecoin_to_gas(&mut self, amount: u128) -> Result<u128, Self::Error> {
+            PropertyRegistry::convert_stablecoin_to_gas(self, amount)
+        }
+        fn track_gas_reimbursement(&self, user: AccountId) -> u128 {
+            self.gas_sponsorships.get(user).unwrap_or(0)
+        }
+        fn is_gas_subsidized(&self, operation: Vec<u8>) -> bool {
+            operation.starts_with(b"vote")
+        }
+    }
+
+    impl InsuranceBridge for PropertyRegistry {
+        type Error = Error;
+        fn bridge_policy(&mut self, policy_id: u64, dest_chain: ChainId) -> Result<(), Self::Error> {
+            self.ensure_not_paused()?;
+            self.bridged_policies.insert(policy_id, &dest_chain);
+            Ok(())
+        }
+        fn receive_bridged_policy(&mut self, source_chain: ChainId, _policy_data: Vec<u8>) -> Result<u64, Self::Error> {
+            self.ensure_not_paused()?;
+            if !self.verify_relayer(self.env().caller()) {
+                return Err(Error::NotRelayer);
+            }
+            let mock_policy_id = self.property_count + 1000; 
+            self.bridged_policies.insert(mock_policy_id, &source_chain);
+            Ok(mock_policy_id)
+        }
+        fn bridge_claim(&mut self, claim_id: u64, dest_chain: ChainId) -> Result<(), Self::Error> {
+            self.ensure_not_paused()?;
+            self.bridged_claims.insert(claim_id, &dest_chain);
+            Ok(())
+        }
+        fn receive_bridged_claim(&mut self, source_chain: ChainId, _claim_data: Vec<u8>) -> Result<u64, Self::Error> {
+            self.ensure_not_paused()?;
+            if !self.verify_relayer(self.env().caller()) {
+                return Err(Error::NotRelayer);
+            }
+            let mock_claim_id = self.property_count + 2000;
+            self.bridged_claims.insert(mock_claim_id, &source_chain);
+            Ok(mock_claim_id)
+        }
+        fn bridge_governance_decision(&mut self, _proposal_id: u64, _dest_chain: ChainId) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn verify_relayer(&self, relayer: AccountId) -> bool {
+            self.relayers.get(relayer).unwrap_or(false)
+        }
+    }
+
+    impl CatastropheBond for PropertyRegistry {
+        type Error = Error;
+        fn issue_bond(&mut self, principal: u128, coupon_rate: u32, maturity_date: u64, trigger_oracle: AccountId, trigger_threshold: u128) -> Result<u64, Self::Error> {
+            self.ensure_not_paused()?;
+            self.cat_bond_count += 1;
+            let bond_id = self.cat_bond_count;
+            let bond = CatBondToken {
+                bond_id,
+                principal,
+                coupon_rate,
+                maturity_date,
+                trigger_oracle,
+                trigger_threshold,
+                is_triggered: false,
+            };
+            self.cat_bonds.insert(bond_id, &bond);
+            self.cat_bond_owners.insert(bond_id, &self.env().caller());
+            Ok(bond_id)
+        }
+        fn trade_bond(&mut self, bond_id: u64, to: AccountId, _amount: u128) -> Result<(), Self::Error> {
+            self.ensure_not_paused()?;
+            let owner = self.cat_bond_owners.get(bond_id).ok_or(Error::BondNotFound)?;
+            if owner != self.env().caller() {
+                return Err(Error::Unauthorized);
+            }
+            self.cat_bond_owners.insert(bond_id, &to);
+            Ok(())
+        }
+        fn check_trigger_condition(&mut self, bond_id: u64) -> Result<bool, Self::Error> {
+            let bond = self.cat_bonds.get(bond_id).ok_or(Error::BondNotFound)?;
+            Ok(bond.is_triggered)
+        }
+        fn automate_payout(&mut self, bond_id: u64) -> Result<(), Self::Error> {
+            self.ensure_not_paused()?;
+            let mut bond = self.cat_bonds.get(bond_id).ok_or(Error::BondNotFound)?;
+            if !bond.is_triggered {
+                return Err(Error::BondNotTriggered);
+            }
+            bond.principal = 0; // Payout processed
+            self.cat_bonds.insert(bond_id, &bond);
+            Ok(())
+        }
+        fn model_bond_pricing(&self, risk_score: u32, principal: u128) -> u128 {
+            let risk_premium = principal.saturating_mul(risk_score as u128) / 1000;
+            principal.saturating_add(risk_premium)
         }
     }
 

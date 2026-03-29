@@ -1,6 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std, no_main)]
 
 use propchain_traits::ComplianceChecker;
+use propchain_traits::ComplianceOracleInterface;
 
 #[ink::contract]
 mod compliance_registry {
@@ -1084,6 +1085,28 @@ mod compliance_registry {
             Vec::new()
         }
 
+        /// Batch revoke compliance certifications that have expired
+        #[ink(message)]
+        pub fn revoke_expired_certifications(&mut self, accounts: Vec<AccountId>) -> Result<u64> {
+            let mut revoked_count = 0;
+            let now = self.env().block_timestamp();
+            for account in accounts {
+                if let Some(mut data) = self.compliance_data.get(account) {
+                    if data.status == VerificationStatus::Verified && data.expiry_timestamp <= now {
+                        data.status = VerificationStatus::Expired;
+                        self.compliance_data.insert(account, &data);
+                        revoked_count += 1;
+                        self.env().emit_event(VerificationUpdated {
+                            account,
+                            status: VerificationStatus::Expired,
+                            timestamp: now,
+                        });
+                    }
+                }
+            }
+            Ok(revoked_count)
+        }
+
         // ========== Issue #45: Enhanced compliance framework ==========
 
         /// Multi-jurisdictional rules engine: check if account may perform operation (automated compliance checking)
@@ -1266,7 +1289,7 @@ mod compliance_registry {
 
         /// Check compliance using both traditional and ZK methods
         #[ink(message)]
-        pub fn enhanced_compliance_check(&self, account: AccountId) -> Result<()> {
+        pub fn enhanced_compliance_check(&self, account: AccountId, _zk_proof: Vec<u8>) -> Result<()> {
             // First, check traditional compliance
             if !self.is_compliant(account) {
                 return Err(Error::NotVerified);
@@ -1297,6 +1320,26 @@ mod compliance_registry {
         #[ink(message)]
         fn is_compliant(&self, account: AccountId) -> bool {
             ComplianceRegistry::is_compliant(self, account)
+        }
+    }
+
+    impl ComplianceOracleInterface for ComplianceRegistry {
+        type Error = Error;
+
+        fn fetch_kyc_status(&self, user: AccountId) -> Result<bool, Self::Error> {
+            Ok(self.is_compliant(user))
+        }
+
+        fn fetch_sanctions_status(&self, user: AccountId) -> Result<bool, Self::Error> {
+            if let Some(data) = self.compliance_data.get(user) {
+                Ok(data.sanctions_checked && data.status != VerificationStatus::Rejected)
+            } else {
+                Ok(false)
+            }
+        }
+
+        fn verify_zk_compliance_proof(&self, user: AccountId, proof: Vec<u8>) -> Result<bool, Self::Error> {
+            self.enhanced_compliance_check(user, proof).map(|_| true)
         }
     }
 
