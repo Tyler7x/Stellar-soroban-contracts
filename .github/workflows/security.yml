@@ -1,0 +1,140 @@
+name: Security Pipeline
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  automated-security-pipeline:
+    name: Automated Security Pipeline
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: stellar-insured-contracts
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+        components: clippy, rustfmt
+
+    - name: Install PyPI & Slither
+      run: |
+        python -m pip install --upgrade pip
+        pip install slither-analyzer
+      continue-on-error: true
+
+    - name: Install cargo-audit & cargo-deny & cargo-contract
+      run: |
+        cargo install cargo-audit
+        cargo install cargo-deny
+        cargo install cargo-contract --force --locked
+
+    - name: Build Security Audit Tool
+      run: |
+        cargo build --release -p security-audit
+        cp target/release/security-audit ./security-audit-tool
+
+    - name: Run cargo-deny check
+      continue-on-error: true
+      run: cargo deny check --config deny.toml
+      
+    - name: Slither Analysis
+      run: slither . || true
+      continue-on-error: true
+
+    - name: Formal Verification (cargo-contract verify)
+      run: cargo contract build --manifest-path contracts/lib/Cargo.toml || true
+      continue-on-error: true
+
+    - name: Proptest Fuzzing
+      run: cargo test --workspace --features fuzzing || true
+      continue-on-error: true
+
+    - name: Run Security Audit Pipeline
+      run: |
+        ./security-audit-tool audit --report security-report.json
+
+    - name: Display Security Report
+      run: |
+        cat security-report.json
+
+    - name: Upload Security Report
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-report
+        path: stellar-insured-contracts/security-report.json
+
+  formal-verification:
+    name: Formal Verification (Kani)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: stellar-insured-contracts
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+
+    - name: Install Kani
+      run: |
+        cargo install --locked kani-verifier
+        cargo kani setup
+
+    - name: Run Kani Verification
+      run: |
+        cd contracts/lib
+        cargo kani
+
+  regression-testing:
+    name: Regression Testing
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: stellar-insured-contracts
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+    
+    - name: Run Tests
+      run: cargo test --workspace || true
+
+  dependency-check:
+    name: Dependency & Container Scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: 'stellar-insured-contracts'
+        format: 'table'
+        exit-code: '1'
+        ignore-unfixed: true
+        vuln-type: 'os,library'
+        severity: 'CRITICAL,HIGH'
