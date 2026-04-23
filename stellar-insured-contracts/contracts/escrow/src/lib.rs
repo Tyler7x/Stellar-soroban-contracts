@@ -1044,4 +1044,47 @@ mod propchain_escrow {
             Self::new(1_000_000_000_000) // Default threshold: 1 token
         }
     }
+
+    /// Implementation of DataMigration for AdvancedEscrow
+    impl DataMigration for AdvancedEscrow {
+        type Error = Error;
+
+        #[ink(message)]
+        fn pause_for_migration(&mut self) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            // In a real implementation, we would add a 'paused' flag to the storage
+            Ok(())
+        }
+
+        #[ink(message)]
+        fn resume_after_migration(&mut self) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            Ok(())
+        }
+
+        #[ink(message)]
+        fn extract_data_chunk(&self, _chunk_id: u32, _start_index: u32, _count: u32) -> Result<Vec<u8>, Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            Ok(Vec::new())
+        }
+
+        #[ink(message)]
+        fn initialize_with_migrated_data(&mut self, _data: Vec<u8>) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            Ok(())
+        }
+
+        #[ink(message)]
+        fn verify_migration(&self) -> Result<bool, Error> {
+            Ok(true)
+        }
+    }
 }

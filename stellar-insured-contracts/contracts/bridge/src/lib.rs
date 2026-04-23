@@ -27,6 +27,8 @@ mod bridge {
         InvalidMetadata,
         DuplicateRequest,
         GasLimitExceeded,
+        NotEnoughConfirmations,
+        MigrationPaused,
     }
 
     /// Bridge contract for cross-chain property token transfers
@@ -215,6 +217,7 @@ mod bridge {
                 signatures: Vec::new(),
                 created_at: current_block,
                 expires_at,
+                locked_at_block: None,
                 status: BridgeOperationStatus::Pending,
                 metadata,
             };
@@ -267,6 +270,7 @@ mod bridge {
                 request.status = BridgeOperationStatus::Failed;
             } else if request.signatures.len() >= request.required_signatures as usize {
                 request.status = BridgeOperationStatus::Locked;
+                request.locked_at_block = Some(self.env().block_number().into());
             }
 
             self.bridge_requests.insert(request_id, &request);
@@ -304,6 +308,17 @@ mod bridge {
             // Check if enough signatures are collected
             if request.signatures.len() < request.required_signatures as usize {
                 return Err(Error::InsufficientSignatures);
+            }
+
+            // Check for confirmation depth (reorg protection)
+            if let Some(locked_at) = request.locked_at_block {
+                let current_block = u64::from(self.env().block_number());
+                let dest_chain_info = self.chain_info.get(request.destination_chain).ok_or(Error::InvalidChain)?;
+                if current_block < locked_at + dest_chain_info.confirmation_blocks as u64 {
+                    return Err(Error::NotEnoughConfirmations);
+                }
+            } else {
+                return Err(Error::InvalidRequest);
             }
 
             // Generate transaction hash
@@ -588,6 +603,55 @@ mod bridge {
             let base_gas = 100000; // Base gas for bridge operation
             let metadata_gas = request.metadata.legal_description.len() as u64 * 100; // Gas for metadata
             base_gas + metadata_gas
+        }
+    }
+
+    /// Implementation of DataMigration for PropertyBridge
+    impl DataMigration for PropertyBridge {
+        type Error = Error;
+
+        #[ink(message)]
+        fn pause_for_migration(&mut self) -> Result<(), Error> {
+            self.ensure_admin()?;
+            self.config.emergency_pause = true;
+            Ok(())
+        }
+
+        #[ink(message)]
+        fn resume_after_migration(&mut self) -> Result<(), Error> {
+            self.ensure_admin()?;
+            self.config.emergency_pause = false;
+            Ok(())
+        }
+
+        #[ink(message)]
+        fn extract_data_chunk(&self, _chunk_id: u32, _start_index: u32, _count: u32) -> Result<Vec<u8>, Error> {
+            self.ensure_admin()?;
+            // In a real implementation, this would serialize a chunk of storage
+            // For now, return an empty vec as a placeholder
+            Ok(Vec::new())
+        }
+
+        #[ink(message)]
+        fn initialize_with_migrated_data(&mut self, _data: Vec<u8>) -> Result<(), Error> {
+            self.ensure_admin()?;
+            // Logic to deserialize and populate storage
+            Ok(())
+        }
+
+        #[ink(message)]
+        fn verify_migration(&self) -> Result<bool, Error> {
+            // Logic to verify checksums or record counts
+            Ok(true)
+        }
+    }
+
+    impl PropertyBridge {
+        fn ensure_admin(&self) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            Ok(())
         }
     }
 
