@@ -75,11 +75,38 @@ mod propchain_oracle {
         /// AI valuation contract address
         ai_valuation_contract: Option<AccountId>,
 
-        /// Verified external events: event_id -> value
-        pub verified_events: Mapping<u64, u128>,
+        /// Risk pool address — receives slashed funds
+        pub risk_pool: Option<AccountId>,
+    }
 
-        /// External event hashes: event_id -> payload_hash
-        pub event_hashes: Mapping<u64, ink::primitives::Hash>,
+    /// Emitted when an oracle source is slashed and funds transferred to the risk pool
+    #[ink(event)]
+    pub struct SourceSlashed {
+        #[ink(topic)]
+        source_id: String,
+        penalty: u128,
+        risk_pool: AccountId,
+    }
+
+    /// Emitted for monitoring: large valuation movements
+    #[ink(event)]
+    pub struct LargeValuationMovement {
+        #[ink(topic)]
+        property_id: u64,
+        old_valuation: u128,
+        new_valuation: u128,
+        /// Change in basis points (1 bp = 0.01%)
+        change_bps: u128,
+        severity: u8, // 1=info, 2=warn, 3=critical
+    }
+
+    /// Emitted for monitoring: source reputation dropped below threshold
+    #[ink(event)]
+    pub struct SourceReputationAlert {
+        #[ink(topic)]
+        source_id: String,
+        reputation: u32,
+        severity: u8,
     }
 
     /// Events emitted by the oracle
@@ -133,9 +160,16 @@ mod propchain_oracle {
                 request_id_counter: 0,
                 confirmation_depth: 6, // 6 blocks default
                 ai_valuation_contract: None,
-                verified_events: Mapping::default(),
-                event_hashes: Mapping::default(),
+                risk_pool: None,
             }
+        }
+
+        /// Set the risk pool address that receives slashed funds (admin only)
+        #[ink(message)]
+        pub fn set_risk_pool(&mut self, risk_pool: AccountId) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            self.risk_pool = Some(risk_pool);
+            Ok(())
         }
 
         /// Get property valuation from multiple sources with aggregation
@@ -205,6 +239,28 @@ mod propchain_oracle {
 
             // Check price alerts
             self.check_price_alerts(property_id, valuation.valuation)?;
+
+            // Monitoring: emit structured event for large movements
+            if let Some(prev) = self.property_valuations.get(&property_id) {
+                if prev.valuation > 0 {
+                    let change_bps = valuation
+                        .valuation
+                        .abs_diff(prev.valuation)
+                        .saturating_mul(10_000)
+                        / prev.valuation;
+                    if change_bps >= 500 {
+                        // >= 5% movement
+                        let severity: u8 = if change_bps >= 2000 { 3 } else if change_bps >= 1000 { 2 } else { 1 };
+                        self.env().emit_event(LargeValuationMovement {
+                            property_id,
+                            old_valuation: prev.valuation,
+                            new_valuation: valuation.valuation,
+                            change_bps,
+                            severity,
+                        });
+                    }
+                }
+            }
 
             // Emit event
             self.env().emit_event(ValuationUpdated {
@@ -301,6 +357,21 @@ mod propchain_oracle {
 
             self.source_reputations.insert(&source_id, &new_rep);
 
+            // Monitoring: alert when reputation crosses warning thresholds
+            if new_rep < 200 {
+                self.env().emit_event(SourceReputationAlert {
+                    source_id: source_id.clone(),
+                    reputation: new_rep,
+                    severity: 3,
+                });
+            } else if new_rep < 400 {
+                self.env().emit_event(SourceReputationAlert {
+                    source_id: source_id.clone(),
+                    reputation: new_rep,
+                    severity: 2,
+                });
+            }
+
             // Auto-deactivate source if reputation falls too low
             if new_rep < 200 {
                 if let Some(mut source) = self.oracle_sources.get(&source_id) {
@@ -313,7 +384,8 @@ mod propchain_oracle {
             Ok(())
         }
 
-        /// Slash an oracle source for providing bad data (admin only)
+        /// Slash an oracle source for providing bad data (admin only).
+        /// Slashed funds are transferred to the configured risk pool.
         #[ink(message)]
         pub fn slash_source(
             &mut self,
@@ -323,8 +395,23 @@ mod propchain_oracle {
             self.ensure_admin()?;
 
             let current_stake = self.source_stakes.get(&source_id).unwrap_or(0);
+            let actual_penalty = penalty.min(current_stake);
             self.source_stakes
-                .insert(&source_id, &current_stake.saturating_sub(penalty));
+                .insert(&source_id, &current_stake.saturating_sub(actual_penalty));
+
+            // Transfer slashed funds to risk pool
+            if actual_penalty > 0 {
+                if let Some(pool) = self.risk_pool {
+                    self.env()
+                        .transfer(pool, actual_penalty)
+                        .map_err(|_| OracleError::InvalidValuation)?;
+                    self.env().emit_event(SourceSlashed {
+                        source_id: source_id.clone(),
+                        penalty: actual_penalty,
+                        risk_pool: pool,
+                    });
+                }
+            }
 
             // Also hit the reputation hard
             self.update_source_reputation(source_id, false)?;
@@ -588,8 +675,16 @@ mod propchain_oracle {
 
             for price_data in &filtered_prices {
                 let weight = self.get_source_weight(&price_data.source)?;
-                total_weighted_price += price_data.price * weight as u128;
-                total_weight += weight;
+                let weighted_price = price_data
+                    .price
+                    .checked_mul(weight as u128)
+                    .ok_or(OracleError::InvalidValuation)?;
+                total_weighted_price = total_weighted_price
+                    .checked_add(weighted_price)
+                    .ok_or(OracleError::InvalidValuation)?;
+                total_weight = total_weight
+                    .checked_add(weight)
+                    .ok_or(OracleError::InvalidParameters)?;
             }
 
             if total_weight == 0 {
@@ -899,29 +994,6 @@ mod propchain_oracle {
         }
     }
 
-    /// Implementation of the ClaimOracle trait from propchain-traits
-    impl propchain_traits::ClaimOracle for PropertyValuationOracle {
-        #[ink(message)]
-        fn submit_external_event(
-            &mut self,
-            event_id: u64,
-            payload_hash: ink::primitives::Hash,
-        ) -> Result<(), OracleError> {
-            self.ensure_admin()?;
-            self.event_hashes.insert(&event_id, &payload_hash);
-            // Default verified value for MVP
-            self.verified_events.insert(&event_id, &100);
-            Ok(())
-        }
-
-        #[ink(message)]
-        fn get_verified_value(&self, event_id: u64) -> Result<u128, OracleError> {
-            self.verified_events
-                .get(&event_id)
-                .ok_or(OracleError::InvalidParameters)
-        }
-    }
-
     impl Default for PropertyValuationOracle {
         fn default() -> Self {
             Self::new(AccountId::from([0x0; 32]))
@@ -1101,6 +1173,51 @@ mod oracle_tests {
         let aggregated = result.expect("Price aggregation should succeed in test");
         // Should be close to the weighted average of 100, 105, 98 ≈ 101
         assert!((98..=105).contains(&aggregated));
+    }
+
+    #[ink::test]
+    fn test_aggregate_prices_rejects_overflow() {
+        let mut oracle = setup_oracle();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        oracle
+            .add_oracle_source(OracleSource {
+                id: "heavy".to_string(),
+                source_type: OracleSourceType::Manual,
+                address: accounts.bob,
+                is_active: true,
+                weight: 100,
+                last_updated: ink::env::block_timestamp::<DefaultEnvironment>(),
+            })
+            .expect("Oracle source registration should succeed in test");
+        oracle
+            .add_oracle_source(OracleSource {
+                id: "light".to_string(),
+                source_type: OracleSourceType::Manual,
+                address: accounts.bob,
+                is_active: true,
+                weight: 1,
+                last_updated: ink::env::block_timestamp::<DefaultEnvironment>(),
+            })
+            .expect("Oracle source registration should succeed in test");
+
+        let prices = vec![
+            PriceData {
+                price: u128::MAX,
+                timestamp: ink::env::block_timestamp::<DefaultEnvironment>(),
+                source: "heavy".to_string(),
+            },
+            PriceData {
+                price: 1,
+                timestamp: ink::env::block_timestamp::<DefaultEnvironment>(),
+                source: "light".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            oracle.aggregate_prices(&prices),
+            Err(OracleError::InvalidValuation)
+        );
     }
 
     #[ink::test]

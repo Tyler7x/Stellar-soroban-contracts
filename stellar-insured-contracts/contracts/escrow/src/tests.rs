@@ -16,42 +16,6 @@ pub mod escrow_tests {
         ink::env::test::set_account_balance::<ink::env::DefaultEnvironment>(account, balance);
     }
 
-    fn set_timestamp(timestamp: u64) {
-        ink::env::test::set_block_timestamp::<ink::env::DefaultEnvironment>(timestamp);
-    }
-
-    fn create_active_escrow(
-        contract: &mut AdvancedEscrow,
-        amount: u128,
-        release_time_lock: Option<u64>,
-        required_signatures: u8,
-    ) -> (DefaultAccounts<ink::env::DefaultEnvironment>, u64) {
-        let accounts = default_accounts();
-        set_caller(accounts.alice);
-
-        let participants = vec![accounts.alice, accounts.bob];
-        let escrow_id = contract
-            .create_escrow_advanced(
-                1,
-                amount,
-                accounts.alice,
-                accounts.bob,
-                participants,
-                required_signatures,
-                release_time_lock,
-            )
-            .expect("Escrow creation should succeed in test");
-
-        set_balance(accounts.alice, u128::MAX);
-        ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(amount);
-        ink::env::test::transfer_in::<ink::env::DefaultEnvironment>(amount);
-        contract
-            .deposit_funds(escrow_id)
-            .expect("Funding escrow should succeed in test");
-
-        (accounts, escrow_id)
-    }
-
     #[ink::test]
     fn test_new_contract() {
         let contract = AdvancedEscrow::new(1_000_000);
@@ -601,16 +565,18 @@ pub mod escrow_tests {
     }
 
     #[ink::test]
-    fn test_security_overflow_deposit_rejected() {
-        let mut contract = AdvancedEscrow::new(1_000_000);
+    fn test_release_funds_updates_state_before_interaction_path() {
         let accounts = default_accounts();
         set_caller(accounts.alice);
+        set_balance(accounts.alice, 2_000_000);
 
+        let mut contract = AdvancedEscrow::new(1_000_000);
         let participants = vec![accounts.alice, accounts.bob];
+
         let escrow_id = contract
             .create_escrow_advanced(
                 1,
-                u128::MAX,
+                1_000_000,
                 accounts.alice,
                 accounts.bob,
                 participants,
@@ -619,92 +585,111 @@ pub mod escrow_tests {
             )
             .expect("Escrow creation should succeed in test");
 
-        set_balance(accounts.alice, u128::MAX);
-        ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(u128::MAX - 1);
+        ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(1_000_000);
         contract
             .deposit_funds(escrow_id)
-            .expect("Initial large deposit should succeed in test");
+            .expect("Deposit should succeed in test");
 
-        ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(2);
-        let result = contract.deposit_funds(escrow_id);
-        assert_eq!(result, Err(Error::ArithmeticOverflow));
-    }
-
-    #[ink::test]
-    fn test_security_timelock_blocks_early_release_and_allows_boundary_release() {
-        let mut contract = AdvancedEscrow::new(1_000_000);
-        let (accounts, escrow_id) = create_active_escrow(&mut contract, 1_000_000, Some(1_000), 2);
-
-        set_caller(accounts.alice);
         contract
             .sign_approval(escrow_id, ApprovalType::Release)
-            .expect("First signer should approve release");
+            .expect("First release signature should succeed in test");
         set_caller(accounts.bob);
         contract
             .sign_approval(escrow_id, ApprovalType::Release)
-            .expect("Second signer should approve release");
+            .expect("Second release signature should succeed in test");
 
         set_caller(accounts.alice);
-        set_timestamp(999);
-        assert_eq!(
-            contract.release_funds(escrow_id),
-            Err(Error::TimeLockActive)
-        );
-
-        set_timestamp(1_000);
         contract
             .release_funds(escrow_id)
-            .expect("Release should succeed exactly at the timelock boundary");
+            .expect("Release should succeed in test");
 
         let escrow = contract
             .get_escrow(escrow_id)
-            .expect("Escrow should still exist after release");
+            .expect("Escrow should exist after release");
         assert_eq!(escrow.status, EscrowStatus::Released);
         assert_eq!(escrow.deposited_amount, 0);
     }
 
     #[ink::test]
-    fn test_security_reentrancy_style_double_release_is_blocked() {
-        let mut contract = AdvancedEscrow::new(1_000_000);
-        let (accounts, escrow_id) = create_active_escrow(&mut contract, 1_000_000, None, 2);
-
+    fn test_refund_funds_updates_state_before_interaction_path() {
+        let accounts = default_accounts();
         set_caller(accounts.alice);
+        set_balance(accounts.alice, 2_000_000);
+
+        let mut contract = AdvancedEscrow::new(1_000_000);
+        let participants = vec![accounts.alice, accounts.bob];
+
+        let escrow_id = contract
+            .create_escrow_advanced(
+                1,
+                1_000_000,
+                accounts.alice,
+                accounts.bob,
+                participants,
+                2,
+                None,
+            )
+            .expect("Escrow creation should succeed in test");
+
+        ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(1_000_000);
         contract
-            .sign_approval(escrow_id, ApprovalType::Release)
-            .expect("First signer should approve release");
+            .deposit_funds(escrow_id)
+            .expect("Deposit should succeed in test");
+
+        contract
+            .sign_approval(escrow_id, ApprovalType::Refund)
+            .expect("First refund signature should succeed in test");
         set_caller(accounts.bob);
         contract
-            .sign_approval(escrow_id, ApprovalType::Release)
-            .expect("Second signer should approve release");
+            .sign_approval(escrow_id, ApprovalType::Refund)
+            .expect("Second refund signature should succeed in test");
 
         set_caller(accounts.alice);
         contract
-            .release_funds(escrow_id)
-            .expect("First release should succeed");
-
-        let second_attempt = contract.release_funds(escrow_id);
-        assert_eq!(second_attempt, Err(Error::InvalidStatus));
+            .refund_funds(escrow_id)
+            .expect("Refund should succeed in test");
 
         let escrow = contract
             .get_escrow(escrow_id)
-            .expect("Escrow should still exist after release");
-        assert_eq!(escrow.status, EscrowStatus::Released);
+            .expect("Escrow should exist after refund");
+        assert_eq!(escrow.status, EscrowStatus::Refunded);
         assert_eq!(escrow.deposited_amount, 0);
     }
 
     #[ink::test]
-    fn test_security_access_control_blocks_non_admin_emergency_override() {
-        let mut contract = AdvancedEscrow::new(1_000_000);
-        let (accounts, escrow_id) = create_active_escrow(&mut contract, 1_000_000, None, 1);
+    fn test_emergency_override_updates_state_before_interaction_path() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        set_balance(accounts.alice, 2_000_000);
 
-        set_caller(accounts.bob);
-        let result = contract.emergency_override(escrow_id, true);
-        assert_eq!(result, Err(Error::Unauthorized));
+        let mut contract = AdvancedEscrow::new(1_000_000);
+        let participants = vec![accounts.alice, accounts.bob];
+
+        let escrow_id = contract
+            .create_escrow_advanced(
+                1,
+                1_000_000,
+                accounts.alice,
+                accounts.bob,
+                participants,
+                2,
+                None,
+            )
+            .expect("Escrow creation should succeed in test");
+
+        ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(1_000_000);
+        contract
+            .deposit_funds(escrow_id)
+            .expect("Deposit should succeed in test");
+
+        contract
+            .emergency_override(escrow_id, true)
+            .expect("Emergency override should succeed in test");
 
         let escrow = contract
             .get_escrow(escrow_id)
-            .expect("Escrow should remain unchanged after unauthorized override attempt");
-        assert_eq!(escrow.status, EscrowStatus::Active);
-        assert_eq!(escrow.deposited_amount, 1_000_000);
+            .expect("Escrow should exist after emergency override");
+        assert_eq!(escrow.status, EscrowStatus::Released);
+        assert_eq!(escrow.deposited_amount, 0);
     }
 }

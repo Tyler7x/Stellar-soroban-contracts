@@ -19,9 +19,6 @@ This project includes a comprehensive automated security pipeline that runs on e
 - **Kani Rust Verifier**: We use Kani to formally verify critical properties of the smart contracts.
 - **Proof Harnesses**: Located in `contracts/lib/src/lib.rs` under `mod verification`.
 
-### 4. Audit Governance
-- **Security Checklist**: `security-audit/checklist.md` tracks contract-area findings, risk level, remediation owner, and release-gate status for audit follow-through.
-
 ## Running Locally
 
 To run the security audit locally:

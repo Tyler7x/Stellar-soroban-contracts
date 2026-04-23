@@ -106,39 +106,28 @@ get_all_proposals() - List all proposals
 get_vote_record(proposal_id, voter) - Check individual voting records
 ✨ Contract Features
 
-Insurance policy creation and lifecycle management
-
-Automated claim validation and settlement
-
-Decentralized risk pool accounting
-
-Professional DAO governance with quorum and threshold requirements
-
-On-chain slashing mechanism with configurable penalties
-
-Deterministic and secure execution
-
-Upgrade-ready contract architecture
-
-Comprehensive voting period enforcement
-
-Efficient proposal storage and querying system
-
-Progressive penalty system for repeat offenders
-
-Fund redirection to risk pool, treasury, or compensation
+- Insurance policy creation and lifecycle management
+- Automated claim validation and settlement
+- Decentralized risk pool accounting
+- Professional DAO governance with quorum and threshold requirements
+- On-chain slashing mechanism with configurable penalties
+- Secure and deterministic execution via Soroban PRNG
+- Capped bridge history to prevent storage explosion
+- Emergency pause mechanism in escrow and bridge contracts
 
 🧑‍💻 Tech Stack
 
-Blockchain: Stellar
+- Blockchain: Stellar
+- Smart Contracts: Soroban
+- Language: Rust
+- SDK: soroban-sdk (v20.0.0)
 
-Smart Contracts: Soroban
-
-Language: Rust
-
-Testing: Soroban test framework
-
-📁 Project Structure contracts/ ├── policy/ ├── claims/ ├── risk_pool/ ├── governance/ └── lib.rs
+📁 Project Structure
+contracts/
+├── bridge/ - Cross-chain property bridge (Soroban)
+├── escrow/ - Advanced escrow system (Soroban)
+├── lib/ - Shared utilities (Randomness, etc.)
+└── ... (Other contracts being migrated)
 
 📦 Setup & Development Prerequisites
 

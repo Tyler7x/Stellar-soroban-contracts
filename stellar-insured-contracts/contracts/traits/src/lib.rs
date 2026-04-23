@@ -725,23 +725,22 @@ pub trait ComplianceChecker {
 }
 
 // =============================================================================
-// Claim Oracle Interface (Issue #145)
+// Property Token Ownership Interface (used by bridge for cross-contract auth)
 // =============================================================================
 
-/// Trait for minimum-viable oracle interface for claim evaluation
+/// Trait for querying property token ownership.
+/// Implemented by the PropertyToken contract and consumed by the bridge
+/// contract to verify that a caller actually owns the token they want to bridge.
 #[ink::trait_definition]
-pub trait ClaimOracle {
-    /// Submit an external event for verification
+pub trait PropertyTokenOwnership {
+    /// Returns the owner of `token_id`, or `None` if the token does not exist.
     #[ink(message)]
-    fn submit_external_event(
-        &mut self,
-        event_id: u64,
-        payload_hash: ink::primitives::Hash,
-    ) -> Result<(), OracleError>;
+    fn owner_of(&self, token_id: TokenId) -> Option<ink::primitives::AccountId>;
 
-    /// Get verified value for an event
+    /// Returns the account approved to transfer `token_id` on behalf of the
+    /// owner, or `None` if no approval has been granted.
     #[ink(message)]
-    fn get_verified_value(&self, event_id: u64) -> Result<u128, OracleError>;
+    fn get_approved(&self, token_id: TokenId) -> Option<ink::primitives::AccountId>;
 }
 
 // =============================================================================

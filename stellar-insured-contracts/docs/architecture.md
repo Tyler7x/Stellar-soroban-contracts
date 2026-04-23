@@ -429,7 +429,3 @@ pub fn health_check(&self) -> HealthStatus {
 - Property-backed lending
 - Yield farming opportunities
 - Liquidity pools for real estate tokens
-
-## Related References
-
-- [DAO Risk Architecture](C:\Users\hp\Desktop\wave\Stellar-soroban-contracts\stellar-insured-contracts\docs\dao-risk-architecture.md): formulae, operating thresholds, pseudocode, and dashboard metrics for exposure, coverage, slashing, and liquidity monitoring

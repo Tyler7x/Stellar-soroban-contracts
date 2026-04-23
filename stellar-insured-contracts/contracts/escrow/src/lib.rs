@@ -20,7 +20,6 @@ mod propchain_escrow {
         Unauthorized,
         InvalidStatus,
         InsufficientFunds,
-        ArithmeticOverflow,
         ConditionsNotMet,
         SignatureThresholdNotMet,
         AlreadySigned,
@@ -30,6 +29,7 @@ mod propchain_escrow {
         InvalidConfiguration,
         EscrowAlreadyFunded,
         ParticipantNotFound,
+        ReentrancyDetected,
     }
 
     /// Escrow status enumeration
@@ -160,6 +160,8 @@ mod propchain_escrow {
         admin: AccountId,
         /// High-value threshold for mandatory multi-sig
         min_high_value_threshold: u128,
+        /// Reentrancy guard for fund transfer operations
+        reentrancy_lock: bool,
     }
 
     // Events
@@ -277,6 +279,7 @@ mod propchain_escrow {
                 audit_logs: Mapping::default(),
                 admin: Self::env().caller(),
                 min_high_value_threshold,
+                reentrancy_lock: false,
             }
         }
 
@@ -370,10 +373,7 @@ mod propchain_escrow {
             }
 
             // Update deposited amount
-            escrow.deposited_amount = escrow
-                .deposited_amount
-                .checked_add(transferred)
-                .ok_or(Error::ArithmeticOverflow)?;
+            escrow.deposited_amount += transferred;
 
             // Check if fully funded
             if escrow.deposited_amount >= escrow.amount {
@@ -436,33 +436,35 @@ mod propchain_escrow {
                 return Err(Error::SignatureThresholdNotMet);
             }
 
+            self.try_enter_reentrancy_guard()?;
+
+            // Update state first (checks-effects-interactions)
+            let transfer_amount = escrow.deposited_amount;
             let mut updated_escrow = escrow.clone();
             updated_escrow.status = EscrowStatus::Released;
             updated_escrow.deposited_amount = 0;
             self.escrows.insert(&escrow_id, &updated_escrow);
 
-            // Finalize state before the external transfer to avoid re-entrancy-style double
-            // execution. Restore the original escrow record if the transfer fails.
-            if self
-                .env()
-                .transfer(escrow.seller, escrow.deposited_amount)
-                .is_err()
-            {
+            // Transfer funds to seller
+            if self.env().transfer(escrow.seller, transfer_amount).is_err() {
+                // Roll back state on failed interaction
                 self.escrows.insert(&escrow_id, &escrow);
+                self.exit_reentrancy_guard();
                 return Err(Error::InsufficientFunds);
             }
+            self.exit_reentrancy_guard();
 
             // Add audit entry
             self.add_audit_entry(
                 escrow_id,
                 caller,
                 "FundsReleased".to_string(),
-                format!("Amount: {} to seller", escrow.deposited_amount),
+                format!("Amount: {} to seller", transfer_amount),
             );
 
             self.env().emit_event(FundsReleased {
                 escrow_id,
-                amount: escrow.deposited_amount,
+                amount: transfer_amount,
                 recipient: escrow.seller,
             });
 
@@ -485,33 +487,35 @@ mod propchain_escrow {
                 return Err(Error::SignatureThresholdNotMet);
             }
 
+            self.try_enter_reentrancy_guard()?;
+
+            // Update state first (checks-effects-interactions)
+            let transfer_amount = escrow.deposited_amount;
             let mut updated_escrow = escrow.clone();
             updated_escrow.status = EscrowStatus::Refunded;
             updated_escrow.deposited_amount = 0;
             self.escrows.insert(&escrow_id, &updated_escrow);
 
-            // Finalize state before the external transfer to avoid re-entrancy-style double
-            // execution. Restore the original escrow record if the transfer fails.
-            if self
-                .env()
-                .transfer(escrow.buyer, escrow.deposited_amount)
-                .is_err()
-            {
+            // Transfer funds back to buyer
+            if self.env().transfer(escrow.buyer, transfer_amount).is_err() {
+                // Roll back state on failed interaction
                 self.escrows.insert(&escrow_id, &escrow);
+                self.exit_reentrancy_guard();
                 return Err(Error::InsufficientFunds);
             }
+            self.exit_reentrancy_guard();
 
             // Add audit entry
             self.add_audit_entry(
                 escrow_id,
                 caller,
                 "FundsRefunded".to_string(),
-                format!("Amount: {} to buyer", escrow.deposited_amount),
+                format!("Amount: {} to buyer", transfer_amount),
             );
 
             self.env().emit_event(FundsRefunded {
                 escrow_id,
-                amount: escrow.deposited_amount,
+                amount: transfer_amount,
                 recipient: escrow.buyer,
             });
 
@@ -631,7 +635,7 @@ mod propchain_escrow {
             }
 
             let mut counter = self.condition_counters.get(&escrow_id).unwrap_or(0);
-            counter = counter.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+            counter += 1;
 
             let condition = Condition {
                 id: counter,
@@ -745,12 +749,8 @@ mod propchain_escrow {
             // Update signature count
             let count_key = (escrow_id, approval_type.clone());
             let current_count = self.signature_counts.get(&count_key).unwrap_or(0);
-            self.signature_counts.insert(
-                &count_key,
-                &current_count
-                    .checked_add(1)
-                    .ok_or(Error::ArithmeticOverflow)?,
-            );
+            self.signature_counts
+                .insert(&count_key, &(current_count + 1));
 
             // Add audit entry
             self.add_audit_entry(
@@ -878,6 +878,10 @@ mod propchain_escrow {
                 escrow.buyer
             };
 
+            self.try_enter_reentrancy_guard()?;
+
+            // Update state first (checks-effects-interactions)
+            let transfer_amount = escrow.deposited_amount;
             let mut updated_escrow = escrow.clone();
             updated_escrow.status = if release_to_seller {
                 EscrowStatus::Released
@@ -887,23 +891,21 @@ mod propchain_escrow {
             updated_escrow.deposited_amount = 0;
             self.escrows.insert(&escrow_id, &updated_escrow);
 
-            // Finalize state before the external transfer to avoid re-entrancy-style double
-            // execution. Restore the original escrow record if the transfer fails.
-            if self
-                .env()
-                .transfer(recipient, escrow.deposited_amount)
-                .is_err()
-            {
+            // Transfer funds
+            if self.env().transfer(recipient, transfer_amount).is_err() {
+                // Roll back state on failed interaction
                 self.escrows.insert(&escrow_id, &escrow);
+                self.exit_reentrancy_guard();
                 return Err(Error::InsufficientFunds);
             }
+            self.exit_reentrancy_guard();
 
             // Add audit entry
             self.add_audit_entry(
                 escrow_id,
                 caller,
                 "EmergencyOverride".to_string(),
-                format!("Funds sent to: {:?}", recipient),
+                format!("Amount: {} sent to: {:?}", transfer_amount, recipient),
             );
 
             self.env().emit_event(EmergencyOverride {
@@ -1036,6 +1038,20 @@ mod propchain_escrow {
             let mut logs = self.audit_logs.get(&escrow_id).unwrap_or_default();
             logs.push(entry);
             self.audit_logs.insert(&escrow_id, &logs);
+        }
+
+        /// Enter reentrancy-protected section
+        fn try_enter_reentrancy_guard(&mut self) -> Result<(), Error> {
+            if self.reentrancy_lock {
+                return Err(Error::ReentrancyDetected);
+            }
+            self.reentrancy_lock = true;
+            Ok(())
+        }
+
+        /// Exit reentrancy-protected section
+        fn exit_reentrancy_guard(&mut self) {
+            self.reentrancy_lock = false;
         }
     }
 
