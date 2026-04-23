@@ -719,3 +719,22 @@ pub trait ComplianceChecker {
     #[ink(message)]
     fn is_compliant(&self, account: ink::primitives::AccountId) -> bool;
 }
+
+// =============================================================================
+// Property Token Ownership Interface (used by bridge for cross-contract auth)
+// =============================================================================
+
+/// Trait for querying property token ownership.
+/// Implemented by the PropertyToken contract and consumed by the bridge
+/// contract to verify that a caller actually owns the token they want to bridge.
+#[ink::trait_definition]
+pub trait PropertyTokenOwnership {
+    /// Returns the owner of `token_id`, or `None` if the token does not exist.
+    #[ink(message)]
+    fn owner_of(&self, token_id: TokenId) -> Option<ink::primitives::AccountId>;
+
+    /// Returns the account approved to transfer `token_id` on behalf of the
+    /// owner, or `None` if no approval has been granted.
+    #[ink(message)]
+    fn get_approved(&self, token_id: TokenId) -> Option<ink::primitives::AccountId>;
+}

@@ -2299,6 +2299,20 @@ mod property_token {
         }
     }
 
+    /// Implement the `PropertyTokenOwnership` trait so the bridge contract can
+    /// verify token ownership via a cross-contract call.
+    impl PropertyTokenOwnership for PropertyToken {
+        #[ink(message)]
+        fn owner_of(&self, token_id: TokenId) -> Option<AccountId> {
+            self.token_owner.get(token_id)
+        }
+
+        #[ink(message)]
+        fn get_approved(&self, token_id: TokenId) -> Option<AccountId> {
+            self.token_approvals.get(token_id)
+        }
+    }
+
     // Unit tests for the PropertyToken contract
     #[cfg(test)]
     mod tests {
