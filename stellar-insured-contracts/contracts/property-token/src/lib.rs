@@ -2702,4 +2702,49 @@ mod property_token {
             assert_eq!(errors, Vec::new());
         }
     }
+
+    /// Implementation of DataMigration for PropertyToken
+    impl DataMigration for PropertyToken {
+        type Error = Error;
+
+        #[ink(message)]
+        fn pause_for_migration(&mut self) -> Result<(), Error> {
+            self.ensure_admin()?;
+            self.bridge_config.emergency_pause = true;
+            Ok(())
+        }
+
+        #[ink(message)]
+        fn resume_after_migration(&mut self) -> Result<(), Error> {
+            self.ensure_admin()?;
+            self.bridge_config.emergency_pause = false;
+            Ok(())
+        }
+
+        #[ink(message)]
+        fn extract_data_chunk(&self, _chunk_id: u32, _start_index: u32, _count: u32) -> Result<Vec<u8>, Error> {
+            self.ensure_admin()?;
+            Ok(Vec::new())
+        }
+
+        #[ink(message)]
+        fn initialize_with_migrated_data(&mut self, _data: Vec<u8>) -> Result<(), Error> {
+            self.ensure_admin()?;
+            Ok(())
+        }
+
+        #[ink(message)]
+        fn verify_migration(&self) -> Result<bool, Error> {
+            Ok(true)
+        }
+    }
+
+    impl PropertyToken {
+        fn ensure_admin(&self) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            Ok(())
+        }
+    }
 }

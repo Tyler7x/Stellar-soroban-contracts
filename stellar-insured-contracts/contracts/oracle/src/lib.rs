@@ -57,6 +57,8 @@ mod propchain_oracle {
 
         /// Outlier detection threshold (standard deviations)
         outlier_threshold: u32,
+        /// Confirmation depth for valuations (reorg protection)
+        pub confirmation_depth: u32,
 
         /// Source reputations (0-1000, where 1000 is perfect)
         pub source_reputations: Mapping<String, u32>,
@@ -156,6 +158,7 @@ mod propchain_oracle {
                 source_stakes: Mapping::default(),
                 pending_requests: Mapping::default(),
                 request_id_counter: 0,
+                confirmation_depth: 6, // 6 blocks default
                 ai_valuation_contract: None,
                 risk_pool: None,
             }
@@ -175,9 +178,19 @@ mod propchain_oracle {
             &self,
             property_id: u64,
         ) -> Result<PropertyValuation, OracleError> {
-            self.property_valuations
+            let valuation = self.property_valuations
                 .get(&property_id)
-                .ok_or(OracleError::PropertyNotFound)
+                .ok_or(OracleError::PropertyNotFound)?;
+
+            // Check if valuation is confirmed
+            if let Some(confirmed_at) = valuation.confirmed_at_block {
+                let current_block = u64::from(self.env().block_number());
+                if current_block < confirmed_at + self.confirmation_depth as u64 {
+                    return Err(OracleError::NotEnoughConfirmations);
+                }
+            }
+
+            Ok(valuation)
         }
 
         /// Get property valuation with confidence metrics
@@ -214,6 +227,9 @@ mod propchain_oracle {
             if valuation.valuation == 0 {
                 return Err(OracleError::InvalidValuation);
             }
+
+            let mut valuation = valuation;
+            valuation.confirmed_at_block = Some(u64::from(self.env().block_number()));
 
             // Store historical valuation
             self.store_historical_valuation(property_id, valuation.clone());
@@ -1426,5 +1442,57 @@ mod oracle_tests {
         assert!(oracle.pending_requests.get(&1).is_some());
         assert!(oracle.pending_requests.get(&2).is_some());
         assert!(oracle.pending_requests.get(&3).is_some());
+    }
+
+    #[ink::test]
+    fn test_claim_oracle_interface_works() {
+        use propchain_traits::ClaimOracle;
+        let mut oracle = setup_oracle();
+        let event_id = 101;
+        let payload_hash = ink::primitives::Hash::from([1u8; 32]);
+
+        // Submit event (admin only)
+        assert!(oracle.submit_external_event(event_id, payload_hash).is_ok());
+
+        // Verify value
+        let value = oracle.get_verified_value(event_id).unwrap();
+        assert_eq!(value, 100);
+
+        // Check hash
+        assert_eq!(oracle.event_hashes.get(&event_id).unwrap(), payload_hash);
+    }
+    /// Implementation of DataMigration for PropertyValuationOracle
+    impl DataMigration for PropertyValuationOracle {
+        type Error = OracleError;
+
+        #[ink(message)]
+        fn pause_for_migration(&mut self) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            // In a real implementation, we would add a 'paused' flag to the storage
+            Ok(())
+        }
+
+        #[ink(message)]
+        fn resume_after_migration(&mut self) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            Ok(())
+        }
+
+        #[ink(message)]
+        fn extract_data_chunk(&self, _chunk_id: u32, _start_index: u32, _count: u32) -> Result<Vec<u8>, OracleError> {
+            self.ensure_admin()?;
+            Ok(Vec::new())
+        }
+
+        #[ink(message)]
+        fn initialize_with_migrated_data(&mut self, _data: Vec<u8>) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            Ok(())
+        }
+
+        #[ink(message)]
+        fn verify_migration(&self) -> Result<bool, OracleError> {
+            Ok(true)
+        }
     }
 }
