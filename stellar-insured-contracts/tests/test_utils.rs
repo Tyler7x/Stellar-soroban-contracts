@@ -253,6 +253,16 @@ pub mod performance {
     }
 }
 
+/// Contract deployment helpers
+pub mod deployment {
+    use super::*;
+
+    /// Get default test accounts for contract deployment
+    pub fn default_accounts<T: ink::env::Environment>() -> DefaultAccounts<T> {
+        ink::env::test::default_accounts::<T>()
+    }
+}
+
 #[cfg(test)]
 mod test_utils_tests {
     use super::*;
