@@ -109,6 +109,16 @@ mod propchain_oracle {
         severity: u8,
     }
 
+    /// Emitted when source reputation is updated
+    #[ink(event)]
+    pub struct SourceReputationUpdated {
+        #[ink(topic)]
+        source_id: String,
+        old_reputation: u32,
+        new_reputation: u32,
+        success: bool,
+    }
+
     /// Events emitted by the oracle
     #[ink(event)]
     pub struct ValuationUpdated {
@@ -135,6 +145,20 @@ mod propchain_oracle {
         source_id: String,
         source_type: OracleSourceType,
         weight: u32,
+    }
+
+    #[ink(event)]
+    pub struct LocationAdjustmentSet {
+        #[ink(topic)]
+        location_code: String,
+        adjustment_factor: u128,
+    }
+
+    #[ink(event)]
+    pub struct MarketTrendUpdated {
+        property_type: PropertyType,
+        location: String,
+        trend_value: i32,
     }
 
     impl PropertyValuationOracle {
@@ -347,15 +371,22 @@ mod propchain_oracle {
             success: bool,
         ) -> Result<(), OracleError> {
             self.ensure_admin()?;
-            let current_rep = self.source_reputations.get(&source_id).unwrap_or(500); // Start at 500
+            let old_rep = self.source_reputations.get(&source_id).unwrap_or(500); // Start at 500
 
             let new_rep = if success {
-                (current_rep + 10).min(1000)
+                (old_rep + 10).min(1000)
             } else {
-                current_rep.saturating_sub(50)
+                old_rep.saturating_sub(50)
             };
 
             self.source_reputations.insert(&source_id, &new_rep);
+
+            self.env().emit_event(SourceReputationUpdated {
+                source_id: source_id.clone(),
+                old_reputation: old_rep,
+                new_reputation: new_rep,
+                success,
+            });
 
             // Monitoring: alert when reputation crosses warning thresholds
             if new_rep < 200 {
@@ -546,6 +577,10 @@ mod propchain_oracle {
             self.ensure_admin()?;
             self.location_adjustments
                 .insert(&adjustment.location_code, &adjustment);
+            self.env().emit_event(LocationAdjustmentSet {
+                location_code: adjustment.location_code,
+                adjustment_factor: adjustment.adjustment_factor,
+            });
             Ok(())
         }
 
@@ -555,6 +590,11 @@ mod propchain_oracle {
             self.ensure_admin()?;
             let key = format!("{:?}_{}", trend.property_type, trend.location);
             self.market_trends.insert(&key, &trend);
+            self.env().emit_event(MarketTrendUpdated {
+                property_type: trend.property_type,
+                location: trend.location,
+                trend_value: trend.trend_value,
+            });
             Ok(())
         }
 

@@ -52,9 +52,83 @@ mod fractional {
         pub transactions: u64,
     }
 
+    #[derive(Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub enum Error {
+        InsufficientBalance,
+        Unauthorized,
+        KycRequired,
+        InvalidAmount,
+        TokenNotFound,
+        Overflow,
+    }
+
+    #[ink(event)]
+    pub struct Transfer {
+        #[ink(topic)]
+        token_id: u64,
+        #[ink(topic)]
+        from: Option<AccountId>,
+        #[ink(topic)]
+        to: Option<AccountId>,
+        amount: u128,
+    }
+
+    #[ink(event)]
+    pub struct Mint {
+        #[ink(topic)]
+        token_id: u64,
+        #[ink(topic)]
+        to: AccountId,
+        amount: u128,
+    }
+
+    #[ink(event)]
+    pub struct Burn {
+        #[ink(topic)]
+        token_id: u64,
+        #[ink(topic)]
+        from: AccountId,
+        amount: u128,
+    }
+
+    #[ink(event)]
+    pub struct PriceUpdated {
+        #[ink(topic)]
+        token_id: u64,
+        price_per_share: u128,
+    }
+
+    #[ink(event)]
+    pub struct KycUpdated {
+        #[ink(topic)]
+        account: AccountId,
+        passed: bool,
+    }
+
+    #[ink(event)]
+    pub struct AuthorizedMinterSet {
+        #[ink(topic)]
+        token_id: u64,
+        minter: AccountId,
+    }
+
+    #[ink(event)]
+    pub struct GovernanceContractSet {
+        governance_contract: AccountId,
+    }
+
     #[ink(storage)]
     pub struct Fractional {
         last_prices: Mapping<u64, u128>,
+        balances: Mapping<(u64, AccountId), u128>,
+        total_supply: Mapping<u64, u128>,
+        authorized_minters: Mapping<u64, AccountId>,
+        kyc_passed: Mapping<AccountId, bool>,
+        dividend_per_share: Mapping<u64, u128>,
+        last_claimed_dividend_per_share: Mapping<(u64, AccountId), u128>,
+        governance_contract: Option<AccountId>,
+        admin: AccountId,
     }
 
     impl Fractional {
@@ -62,12 +136,21 @@ mod fractional {
         pub fn new() -> Self {
             Self {
                 last_prices: Mapping::default(),
+                balances: Mapping::default(),
+                total_supply: Mapping::default(),
+                authorized_minters: Mapping::default(),
+                kyc_passed: Mapping::default(),
+                dividend_per_share: Mapping::default(),
+                last_claimed_dividend_per_share: Mapping::default(),
+                governance_contract: None,
+                admin: Self::env().caller(),
             }
         }
 
         #[ink(message)]
         pub fn set_last_price(&mut self, token_id: u64, price_per_share: u128) {
             self.last_prices.insert(token_id, &price_per_share);
+            self.env().emit_event(PriceUpdated { token_id, price_per_share });
         }
 
         #[ink(message)]
@@ -114,6 +197,146 @@ mod fractional {
                 total_proceeds,
                 transactions: (dividends.len() + proceeds.len()) as u64,
             }
+        }
+
+        #[ink(message)]
+        pub fn mint(&mut self, token_id: u64, to: AccountId, amount: u128) -> Result<(), Error> {
+            let caller = self.env().caller();
+            let minter = self.authorized_minters.get(token_id).ok_or(Error::Unauthorized)?;
+            if caller != minter {
+                return Err(Error::Unauthorized);
+            }
+            if amount == 0 {
+                return Err(Error::InvalidAmount);
+            }
+            let current_balance = self.balances.get((token_id, to)).unwrap_or(0);
+            let new_balance = current_balance.checked_add(amount).ok_or(Error::Overflow)?;
+            self.balances.insert((token_id, to), &new_balance);
+            let current_supply = self.total_supply.get(token_id).unwrap_or(0);
+            let new_supply = current_supply.checked_add(amount).ok_or(Error::Overflow)?;
+            self.total_supply.insert(token_id, &new_supply);
+            self.env().emit_event(Mint { token_id, to, amount });
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn burn(&mut self, token_id: u64, from: AccountId, amount: u128) -> Result<(), Error> {
+            let caller = self.env().caller();
+            if caller != from && caller != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            if amount == 0 {
+                return Err(Error::InvalidAmount);
+            }
+            let current_balance = self.balances.get((token_id, from)).unwrap_or(0);
+            if current_balance < amount {
+                return Err(Error::InsufficientBalance);
+            }
+            let new_balance = current_balance - amount;
+            self.balances.insert((token_id, from), &new_balance);
+            let current_supply = self.total_supply.get(token_id).unwrap_or(0);
+            let new_supply = current_supply - amount;
+            self.total_supply.insert(token_id, &new_supply);
+            self.env().emit_event(Burn { token_id, from, amount });
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn transfer(&mut self, token_id: u64, to: AccountId, amount: u128) -> Result<(), Error> {
+            let from = self.env().caller();
+            if !self.kyc_passed.get(from).unwrap_or(false) || !self.kyc_passed.get(to).unwrap_or(false) {
+                return Err(Error::KycRequired);
+            }
+            if amount == 0 {
+                return Err(Error::InvalidAmount);
+            }
+            let from_balance = self.balances.get((token_id, from)).unwrap_or(0);
+            if from_balance < amount {
+                return Err(Error::InsufficientBalance);
+            }
+            let to_balance = self.balances.get((token_id, to)).unwrap_or(0);
+            let new_from_balance = from_balance - amount;
+            let new_to_balance = to_balance.checked_add(amount).ok_or(Error::Overflow)?;
+            self.balances.insert((token_id, from), &new_from_balance);
+            self.balances.insert((token_id, to), &new_to_balance);
+            self.env().emit_event(Transfer { token_id, from: Some(from), to: Some(to), amount });
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn balance_of(&self, token_id: u64, account: AccountId) -> u128 {
+            self.balances.get((token_id, account)).unwrap_or(0)
+        }
+
+        #[ink(message)]
+        pub fn total_supply_of(&self, token_id: u64) -> u128 {
+            self.total_supply.get(token_id).unwrap_or(0)
+        }
+
+        #[ink(message)]
+        pub fn distribute_dividends(&mut self, token_id: u64, total_dividend: u128) -> Result<(), Error> {
+            let caller = self.env().caller();
+            let minter = self.authorized_minters.get(token_id).ok_or(Error::Unauthorized)?;
+            if caller != minter {
+                return Err(Error::Unauthorized);
+            }
+            let supply = self.total_supply.get(token_id).unwrap_or(0);
+            if supply == 0 {
+                return Err(Error::InvalidAmount);
+            }
+            let dividend_per_share_add = total_dividend / supply;
+            let current_dividend_per_share = self.dividend_per_share.get(token_id).unwrap_or(0);
+            let new_dividend_per_share = current_dividend_per_share.checked_add(dividend_per_share_add).ok_or(Error::Overflow)?;
+            self.dividend_per_share.insert(token_id, &new_dividend_per_share);
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn claim_dividends(&mut self, token_id: u64) -> Result<u128, Error> {
+            let account = self.env().caller();
+            let balance = self.balances.get((token_id, account)).unwrap_or(0);
+            if balance == 0 {
+                return Ok(0);
+            }
+            let current_dividend_per_share = self.dividend_per_share.get(token_id).unwrap_or(0);
+            let last_claimed = self.last_claimed_dividend_per_share.get((token_id, account)).unwrap_or(0);
+            let dividend_per_share = current_dividend_per_share.saturating_sub(last_claimed);
+            let total_dividend = dividend_per_share.saturating_mul(balance);
+            self.last_claimed_dividend_per_share.insert((token_id, account), &current_dividend_per_share);
+            Ok(total_dividend)
+        }
+
+        #[ink(message)]
+        pub fn set_kyc(&mut self, account: AccountId, passed: bool) -> Result<(), Error> {
+            let caller = self.env().caller();
+            if caller != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            self.kyc_passed.insert(account, &passed);
+            self.env().emit_event(KycUpdated { account, passed });
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn set_authorized_minter(&mut self, token_id: u64, minter: AccountId) -> Result<(), Error> {
+            let caller = self.env().caller();
+            if caller != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            self.authorized_minters.insert(token_id, &minter);
+            self.env().emit_event(AuthorizedMinterSet { token_id, minter });
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn set_governance_contract(&mut self, gov_contract: AccountId) -> Result<(), Error> {
+            let caller = self.env().caller();
+            if caller != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            self.governance_contract = Some(gov_contract);
+            self.env().emit_event(GovernanceContractSet { governance_contract: gov_contract });
+            Ok(())
         }
     }
 }
