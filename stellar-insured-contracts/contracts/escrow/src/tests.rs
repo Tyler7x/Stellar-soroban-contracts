@@ -692,4 +692,255 @@ pub mod escrow_tests {
         assert_eq!(escrow.status, EscrowStatus::Released);
         assert_eq!(escrow.deposited_amount, 0);
     }
+
+    // =========================================================================
+    // Issue #310: Input validation – amount must be > 0
+    // =========================================================================
+
+    #[ink::test]
+    fn test_create_escrow_zero_amount_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = AdvancedEscrow::new(1_000_000);
+        let participants = vec![accounts.alice, accounts.bob];
+
+        let result = contract.create_escrow_advanced(
+            1,
+            0, // zero amount – must be rejected
+            accounts.alice,
+            accounts.bob,
+            participants,
+            1,
+            None,
+        );
+        assert_eq!(result, Err(Error::InvalidConfiguration));
+    }
+
+    // =========================================================================
+    // Issue #294: Initialization edge case tests
+    // =========================================================================
+
+    #[ink::test]
+    fn test_init_zero_threshold() {
+        // A threshold of 0 is a valid constructor value (no high-value enforcement)
+        let contract = AdvancedEscrow::new(0);
+        assert_eq!(contract.get_high_value_threshold(), 0);
+    }
+
+    #[ink::test]
+    fn test_init_max_u128_threshold() {
+        let contract = AdvancedEscrow::new(u128::MAX);
+        assert_eq!(contract.get_high_value_threshold(), u128::MAX);
+    }
+
+    #[ink::test]
+    fn test_create_escrow_zero_required_signatures_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = AdvancedEscrow::new(1_000_000);
+        let participants = vec![accounts.alice, accounts.bob];
+
+        let result = contract.create_escrow_advanced(
+            1,
+            1_000_000,
+            accounts.alice,
+            accounts.bob,
+            participants,
+            0, // zero required signatures – must be rejected
+            None,
+        );
+        assert_eq!(result, Err(Error::InvalidConfiguration));
+    }
+
+    #[ink::test]
+    fn test_create_escrow_empty_participants_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = AdvancedEscrow::new(1_000_000);
+
+        let result = contract.create_escrow_advanced(
+            1,
+            1_000_000,
+            accounts.alice,
+            accounts.bob,
+            vec![], // empty participants – must be rejected
+            1,
+            None,
+        );
+        assert_eq!(result, Err(Error::InvalidConfiguration));
+    }
+
+    #[ink::test]
+    fn test_create_escrow_max_amount() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = AdvancedEscrow::new(u128::MAX);
+        let participants = vec![accounts.alice, accounts.bob];
+
+        let result = contract.create_escrow_advanced(
+            u64::MAX,
+            u128::MAX,
+            accounts.alice,
+            accounts.bob,
+            participants,
+            1,
+            None,
+        );
+        assert!(result.is_ok());
+        let escrow = contract.get_escrow(result.unwrap()).unwrap();
+        assert_eq!(escrow.amount, u128::MAX);
+        assert_eq!(escrow.property_id, u64::MAX);
+    }
+
+    #[ink::test]
+    fn test_double_init_admin_is_caller() {
+        // Each new() call sets admin to the current caller – verify isolation
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let contract_a = AdvancedEscrow::new(1_000);
+        assert_eq!(contract_a.get_admin(), accounts.alice);
+
+        set_caller(accounts.bob);
+        let contract_b = AdvancedEscrow::new(1_000);
+        assert_eq!(contract_b.get_admin(), accounts.bob);
+    }
+
+    // =========================================================================
+    // Issue #296: Regression tests – guard against previously-fixed bugs
+    // =========================================================================
+
+    #[ink::test]
+    fn regression_escrow_count_increments_correctly() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = AdvancedEscrow::new(1_000_000);
+        let participants = vec![accounts.alice, accounts.bob];
+
+        for expected_id in 1u64..=3 {
+            let id = contract
+                .create_escrow_advanced(
+                    expected_id,
+                    1_000,
+                    accounts.alice,
+                    accounts.bob,
+                    participants.clone(),
+                    1,
+                    None,
+                )
+                .expect("Escrow creation should succeed");
+            assert_eq!(id, expected_id);
+        }
+    }
+
+    #[ink::test]
+    fn regression_deposit_does_not_overflow_deposited_amount() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        set_balance(accounts.alice, u128::MAX);
+        let mut contract = AdvancedEscrow::new(1_000_000);
+        let participants = vec![accounts.alice, accounts.bob];
+
+        let escrow_id = contract
+            .create_escrow_advanced(
+                1,
+                2_000,
+                accounts.alice,
+                accounts.bob,
+                participants,
+                1,
+                None,
+            )
+            .unwrap();
+
+        ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(1_000);
+        contract.deposit_funds(escrow_id).unwrap();
+
+        let escrow = contract.get_escrow(escrow_id).unwrap();
+        assert_eq!(escrow.deposited_amount, 1_000);
+        assert_eq!(escrow.status, EscrowStatus::Funded);
+
+        ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(1_000);
+        contract.deposit_funds(escrow_id).unwrap();
+
+        let escrow = contract.get_escrow(escrow_id).unwrap();
+        assert_eq!(escrow.deposited_amount, 2_000);
+        assert_eq!(escrow.status, EscrowStatus::Active);
+    }
+
+    #[ink::test]
+    fn regression_non_participant_cannot_upload_document() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = AdvancedEscrow::new(1_000_000);
+        let participants = vec![accounts.alice, accounts.bob];
+
+        let escrow_id = contract
+            .create_escrow_advanced(
+                1,
+                1_000_000,
+                accounts.alice,
+                accounts.bob,
+                participants,
+                1,
+                None,
+            )
+            .unwrap();
+
+        set_caller(accounts.charlie); // not a participant
+        let result =
+            contract.upload_document(escrow_id, Hash::from([9u8; 32]), "Deed".to_string());
+        assert_eq!(result, Err(Error::Unauthorized));
+    }
+
+    #[ink::test]
+    fn regression_duplicate_dispute_rejected() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = AdvancedEscrow::new(1_000_000);
+        let participants = vec![accounts.alice, accounts.bob];
+
+        let escrow_id = contract
+            .create_escrow_advanced(
+                1,
+                1_000_000,
+                accounts.alice,
+                accounts.bob,
+                participants,
+                1,
+                None,
+            )
+            .unwrap();
+
+        contract
+            .raise_dispute(escrow_id, "First dispute".to_string())
+            .unwrap();
+
+        // Second dispute while first is unresolved must be rejected
+        let result = contract.raise_dispute(escrow_id, "Second dispute".to_string());
+        assert_eq!(result, Err(Error::DisputeActive));
+    }
+
+    #[ink::test]
+    fn regression_release_requires_active_status() {
+        let accounts = default_accounts();
+        set_caller(accounts.alice);
+        let mut contract = AdvancedEscrow::new(1_000_000);
+        let participants = vec![accounts.alice, accounts.bob];
+
+        let escrow_id = contract
+            .create_escrow_advanced(
+                1,
+                1_000_000,
+                accounts.alice,
+                accounts.bob,
+                participants,
+                1,
+                None,
+            )
+            .unwrap();
+
+        // Escrow is in Created state – release must fail
+        let result = contract.release_funds(escrow_id);
+        assert_eq!(result, Err(Error::InvalidStatus));
+    }
 }

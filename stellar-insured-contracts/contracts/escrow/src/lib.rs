@@ -298,6 +298,10 @@ mod propchain_escrow {
             let caller = self.env().caller();
 
             // Validate configuration
+            if amount == 0 {
+                return Err(Error::InvalidConfiguration);
+            }
+
             if required_signatures == 0 || participants.is_empty() {
                 return Err(Error::InvalidConfiguration);
             }
