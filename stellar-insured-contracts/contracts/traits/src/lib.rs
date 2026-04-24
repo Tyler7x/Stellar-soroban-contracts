@@ -18,6 +18,8 @@ pub enum OracleError {
     InsufficientReputation,
     SourceAlreadyExists,
     RequestPending,
+    NotEnoughConfirmations,
+    MigrationRequired,
 }
 
 /// Trait definitions for PropChain contracts
@@ -116,6 +118,7 @@ pub struct PropertyValuation {
     pub sources_used: u32,     // Number of price sources used
     pub last_updated: u64,     // Last update timestamp
     pub valuation_method: ValuationMethod,
+    pub confirmed_at_block: Option<u64>, // Block number when valuation was confirmed
 }
 
 /// Valuation method enumeration
@@ -626,6 +629,7 @@ pub struct MultisigBridgeRequest {
     pub signatures: Vec<ink::primitives::AccountId>,
     pub created_at: u64,
     pub expires_at: Option<u64>,
+    pub locked_at_block: Option<u64>, // Block number when request was locked (all signatures collected)
     pub status: BridgeOperationStatus,
     pub metadata: PropertyMetadata,
 }
@@ -718,4 +722,54 @@ pub trait ComplianceChecker {
     /// Returns true if the account meets current compliance requirements
     #[ink(message)]
     fn is_compliant(&self, account: ink::primitives::AccountId) -> bool;
+}
+
+// =============================================================================
+// Property Token Ownership Interface (used by bridge for cross-contract auth)
+// =============================================================================
+
+/// Trait for querying property token ownership.
+/// Implemented by the PropertyToken contract and consumed by the bridge
+/// contract to verify that a caller actually owns the token they want to bridge.
+#[ink::trait_definition]
+pub trait PropertyTokenOwnership {
+    /// Returns the owner of `token_id`, or `None` if the token does not exist.
+    #[ink(message)]
+    fn owner_of(&self, token_id: TokenId) -> Option<ink::primitives::AccountId>;
+
+    /// Returns the account approved to transfer `token_id` on behalf of the
+    /// owner, or `None` if no approval has been granted.
+    #[ink(message)]
+    fn get_approved(&self, token_id: TokenId) -> Option<ink::primitives::AccountId>;
+}
+
+// =============================================================================
+// Data Migration Framework (Issue #308)
+// =============================================================================
+
+/// Trait for contract data migration
+#[ink::trait_definition]
+pub trait DataMigration {
+    /// Error type for migration operations
+    type Error;
+
+    /// Pause the contract for migration
+    #[ink(message)]
+    fn pause_for_migration(&mut self) -> Result<(), Self::Error>;
+
+    /// Unpause the contract after migration
+    #[ink(message)]
+    fn resume_after_migration(&mut self) -> Result<(), Self::Error>;
+
+    /// Extract a chunk of data for migration (generic byte representation)
+    #[ink(message)]
+    fn extract_data_chunk(&self, chunk_id: u32, start_index: u32, count: u32) -> Result<Vec<u8>, Self::Error>;
+
+    /// Initialize the contract with migrated data
+    #[ink(message)]
+    fn initialize_with_migrated_data(&mut self, data: Vec<u8>) -> Result<(), Self::Error>;
+
+    /// Verify the migrated data integrity
+    #[ink(message)]
+    fn verify_migration(&self) -> Result<bool, Self::Error>;
 }

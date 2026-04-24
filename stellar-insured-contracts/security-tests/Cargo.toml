@@ -1,0 +1,38 @@
+[workspace]
+
+[package]
+name = "propchain-security-tests"
+version = "1.0.0"
+authors = ["PropChain Team <dev@propchain.io>"]
+edition = "2021"
+description = "Property-based and fuzz testing for PropChain contract security"
+license = "MIT"
+publish = false
+
+[dependencies]
+proptest = "1.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+proptest = "1.4"
+
+[features]
+default = ["std"]
+std = []
+
+[lib]
+name = "propchain_security_tests"
+path = "src/lib.rs"
+
+[[bin]]
+name = "property_based_tests"
+path = "src/property_based_tests.rs"
+
+[[bin]]
+name = "fuzz_tests"
+path = "src/fuzz_tests.rs"
+
+[[bin]]
+name = "security_analysis"
+path = "src/security_analysis.rs"
